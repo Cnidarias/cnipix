@@ -42,6 +42,10 @@ const HISTORY_LIMIT: usize = 100;
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
     Pencil,
+    Line,
+    Rectangle,
+    Ellipse,
+    Eyedropper,
     Select,
     Fill,
     Paste,
@@ -439,6 +443,8 @@ fn App() -> Element {
     let mut clipboard = use_signal(|| None::<Clipboard>);
     let mut hovered_pixel = use_signal(|| None::<usize>);
     let mut painting = use_signal(|| false);
+    let mut shape_start = use_signal(|| None::<(usize, usize)>);
+    let mut mirror_drawing = use_signal(|| false);
     let mut playing = use_signal(|| false);
     let mut preview_open = use_signal(|| false);
     let mut onion_skin = use_signal(|| true);
@@ -777,6 +783,10 @@ fn App() -> Element {
                         }
                     }
                     "b" => tool.set(Tool::Pencil),
+                    "l" => tool.set(Tool::Line),
+                    "u" => tool.set(Tool::Rectangle),
+                    "o" => tool.set(Tool::Ellipse),
+                    "i" => tool.set(Tool::Eyedropper),
                     "m" => tool.set(Tool::Select),
                     "g" => tool.set(Tool::Fill),
                     _ => {
@@ -791,6 +801,18 @@ fn App() -> Element {
                 }
             },
             onpointerup: move |_| {
+                let start = *shape_start.read();
+                let endpoint = *hovered_pixel.read();
+                if let (Some((sx, sy)), Some(end)) = (start, endpoint) {
+                    let frame = *selected_frame.read();
+                    let color = *selected_color.read() as u8;
+                    let points = shape_pixels(*tool.read(), sx, sy, end % *width.read(), end / *width.read());
+                    if !points.is_empty() {
+                        record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame);
+                        frames.with_mut(|all| for (x,y) in points { all[frame].pixels[y * *width.read() + x] = color; if mirror_drawing() { let mx = width.read().saturating_sub(1) - x; all[frame].pixels[y * *width.read() + mx] = color; } });
+                    }
+                    shape_start.set(None);
+                }
                 painting.set(false);
                 right_erasing.set(false);
                 selection_anchor.set(None);
@@ -800,7 +822,7 @@ fn App() -> Element {
                 }
                 selection_drag.set(None);
             },
-            onpointercancel: move |_| { painting.set(false); right_erasing.set(false); selection_anchor.set(None); selection_drag.set(None); },
+            onpointercancel: move |_| { painting.set(false); right_erasing.set(false); selection_anchor.set(None); selection_drag.set(None); shape_start.set(None); },
             header {
                 class: "topbar",
                 div { class: "brand-lockup",
@@ -1109,6 +1131,11 @@ fn App() -> Element {
                         selected_frame.set(at);
                     }, "Duplicate" }
                     button { class: if active_tool == Tool::Pencil { "button button-tool active" } else { "button button-tool" }, onclick: move |_| tool.set(Tool::Pencil), "✎ Pencil (B)" }
+                    button { class: if active_tool == Tool::Line { "button button-tool active" } else { "button button-tool" }, title: "Line (L)", onclick: move |_| tool.set(Tool::Line), "╱ Line (L)" }
+                    button { class: if active_tool == Tool::Rectangle { "button button-tool active" } else { "button button-tool" }, title: "Rectangle (U)", onclick: move |_| tool.set(Tool::Rectangle), "▱ Rect (U)" }
+                    button { class: if active_tool == Tool::Ellipse { "button button-tool active" } else { "button button-tool" }, title: "Ellipse (O)", onclick: move |_| tool.set(Tool::Ellipse), "◯ Ellipse (O)" }
+                    button { class: if active_tool == Tool::Eyedropper { "button button-tool active" } else { "button button-tool" }, title: "Eyedropper (I)", onclick: move |_| tool.set(Tool::Eyedropper), "⌕ Pick (I)" }
+                    button { class: if *mirror_drawing.read() { "button button-tool active" } else { "button button-tool" }, title: "Mirror drawing across canvas center", onclick: move |_| mirror_drawing.set(!mirror_drawing()), "⇋ Mirror" }
                     button { class: if active_tool == Tool::Select { "button button-tool active" } else { "button button-tool" }, onclick: move |_| tool.set(Tool::Select), "▧ Select (M)" }
                     button { class: if active_tool == Tool::Fill { "button button-tool active" } else { "button button-tool" }, onclick: move |_| tool.set(Tool::Fill), "▨ Fill (G)" }
                     button { class: "button button-quiet", disabled: selected_region.is_none(), onclick: move |_| {
@@ -1443,6 +1470,8 @@ fn App() -> Element {
                                     selected_color,
                                     palette,
                                     painting,
+                                    shape_start,
+                                    mirror_drawing,
                                     right_erasing,
                                     tool,
                                     selection,
@@ -1456,6 +1485,17 @@ fn App() -> Element {
                                     frame_time_ms,
                                     animation_name,
                                 }
+                            }
+                            ShapePreview {
+                                width: w,
+                                height: h,
+                                pixel_size: zoomed_pixel,
+                                tool,
+                                start: shape_start,
+                                hovered: hovered_pixel,
+                                selected_color,
+                                palette,
+                                mirror: mirror_drawing,
                             }
                         }
                     }
@@ -2404,6 +2444,8 @@ fn PixelCell(
     selected_color: Signal<usize>,
     palette: Signal<Vec<String>>,
     mut painting: Signal<bool>,
+    mut shape_start: Signal<Option<(usize, usize)>>,
+    mirror_drawing: Signal<bool>,
     mut right_erasing: Signal<bool>,
     mut tool: Signal<Tool>,
     mut selection: Signal<Option<Selection>>,
@@ -2477,11 +2519,20 @@ fn PixelCell(
                 let y = index / width;
                 let current_tool = *tool.read();
                 match current_tool {
+                    Tool::Line | Tool::Rectangle | Tool::Ellipse => {
+                        shape_start.set(Some((x, y)));
+                        painting.set(true);
+                        hovered_pixel.set(Some(index));
+                    }
+                    Tool::Eyedropper => {
+                        selected_color.set(frames.read()[frame].pixels[index] as usize);
+                        tool.set(Tool::Pencil);
+                    }
                     Tool::Pencil => {
                         record_document(&mut history, &frames, &width_state, &height_state, &frame_time_ms, &palette, &animation_name, &selected_frame);
                         painting.set(true);
                         let color = *selected_color.read() as u8;
-                        frames.with_mut(|all| all[frame].pixels[index] = color);
+                        frames.with_mut(|all| { all[frame].pixels[index] = color; if mirror_drawing() { let mx = width.saturating_sub(1) - x; all[frame].pixels[y * width + mx] = color; } });
                     }
                     Tool::Fill => {
                         let color = *selected_color.read() as u8;
@@ -2527,8 +2578,9 @@ fn PixelCell(
                     match current_tool {
                         Tool::Pencil if painting() => {
                             let color = *selected_color.read() as u8;
-                            frames.with_mut(|all| all[frame].pixels[index] = color);
+                            frames.with_mut(|all| { all[frame].pixels[index] = color; if mirror_drawing() { let mx = width.saturating_sub(1) - col; all[frame].pixels[row * width + mx] = color; } });
                         }
+                        Tool::Line | Tool::Rectangle | Tool::Ellipse if shape_start.read().is_some() => { hovered_pixel.set(Some(index)); }
                         Tool::Select => {
                             if let Some((anchor_x, anchor_y)) = *selection_anchor.read() {
                                 selection.set(Some(selection_from_points(anchor_x, anchor_y, col, row)));
@@ -2544,6 +2596,95 @@ fn PixelCell(
                     }
                 }
             },
+        }
+    }
+}
+
+fn shape_pixels(tool: Tool, x0: usize, y0: usize, x1: usize, y1: usize) -> Vec<(usize, usize)> {
+    match tool {
+        Tool::Line => {
+            let (mut x, mut y) = (x0 as isize, y0 as isize);
+            let (tx, ty) = (x1 as isize, y1 as isize);
+            let dx = (tx - x).abs(); let sx = if x < tx { 1 } else { -1 };
+            let dy = -(ty - y).abs(); let sy = if y < ty { 1 } else { -1 };
+            let mut err = dx + dy; let mut out = Vec::new();
+            loop { out.push((x as usize, y as usize)); if x == tx && y == ty { break; } let e2 = 2 * err; if e2 >= dy { err += dy; x += sx; } if e2 <= dx { err += dx; y += sy; } }
+            out
+        }
+        Tool::Rectangle => {
+            let (x0, x1) = (x0.min(x1), x0.max(x1));
+            let (y0, y1) = (y0.min(y1), y0.max(y1));
+            let mut out = Vec::new();
+            for x in x0..=x1 { out.push((x,y0)); if y1 != y0 { out.push((x,y1)); } }
+            for y in y0+1..y1 { out.push((x0,y)); if x1 != x0 { out.push((x1,y)); } }
+            out
+        }
+        Tool::Ellipse => {
+            let (x0, x1) = (x0.min(x1), x0.max(x1));
+            let (y0, y1) = (y0.min(y1), y0.max(y1));
+            let mut out = Vec::new();
+            let cx = (x0 + x1) as f64 / 2.0; let cy = (y0 + y1) as f64 / 2.0;
+            let rx = ((x1 - x0 + 1) as f64 / 2.0).max(0.5); let ry = ((y1 - y0 + 1) as f64 / 2.0).max(0.5);
+            for y in y0..=y1 { for x in x0..=x1 {
+                let nx = (x as f64 - cx) / rx; let ny = (y as f64 - cy) / ry;
+                let d = nx * nx + ny * ny;
+                if d <= 1.25 && (d >= 0.55 || rx < 1.0 || ry < 1.0) { out.push((x,y)); }
+            } }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[component]
+fn ShapePreview(
+    width: usize,
+    height: usize,
+    pixel_size: f32,
+    tool: Signal<Tool>,
+    start: Signal<Option<(usize, usize)>>,
+    hovered: Signal<Option<usize>>,
+    selected_color: Signal<usize>,
+    palette: Signal<Vec<String>>,
+    mirror: Signal<bool>,
+) -> Element {
+    let Some((sx, sy)) = *start.read() else { return rsx! {}; };
+    let Some(end) = *hovered.read() else { return rsx! {}; };
+    let active_tool = *tool.read();
+    let canvas_width = width;
+    let mut points = shape_pixels(active_tool, sx, sy, end % canvas_width, end / canvas_width);
+    if *mirror.read() {
+        let mirrored = points.iter().map(|(x, y)| (width - 1 - x, *y)).collect::<Vec<_>>();
+        points.extend(mirrored);
+    }
+    points.sort_unstable();
+    points.dedup();
+    let color_index = (*selected_color.read()).min(palette.read().len().saturating_sub(1));
+    let color = palette.read()[color_index].clone();
+    let pixel_size = pixel_size as f64;
+    let pitch = pixel_size + 1.0;
+    let svg_width = width as f64 * pitch - 1.0;
+    let svg_height = height as f64 * pitch - 1.0;
+    rsx! {
+        svg {
+            class: "shape-preview",
+            style: "left:2px;top:2px;width:{svg_width}px;height:{svg_height}px",
+            view_box: "0 0 {svg_width} {svg_height}",
+            preserve_aspect_ratio: "none",
+            for (x, y) in points {
+                rect {
+                    x: "{x as f64 * pitch}",
+                    y: "{y as f64 * pitch}",
+                    width: "{pixel_size}",
+                    height: "{pixel_size}",
+                    fill: "{color}",
+                    fill_opacity: "0.68",
+                    stroke: "#ffffff",
+                    stroke_opacity: "0.8",
+                    stroke_width: "0.6",
+                    key: "shape-{x}-{y}"
+                }
+            }
         }
     }
 }
