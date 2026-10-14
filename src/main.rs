@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Cursor;
 
@@ -82,6 +83,142 @@ struct LoadedProject {
     frame_time_ms: u32,
     frames: Vec<Frame>,
     animation_count: usize,
+    palette: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Deserialize)]
+struct MappedProject {
+    id: u32,
+    path: String,
+    animations: Vec<MappedAnimation>,
+}
+
+#[derive(Clone, PartialEq, Deserialize)]
+struct MappedAnimation {
+    name: String,
+    index: usize,
+    preview: String,
+}
+
+#[derive(Clone, PartialEq)]
+struct ActiveMapping {
+    id: u32,
+    animation_index: usize,
+    json_path: String,
+    manifest: String,
+    png: Vec<u8>,
+    original_frame_indices: Vec<usize>,
+    original_width: usize,
+    original_height: usize,
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+let cnipixRoot = null;
+let cnipixFiles = [];
+
+export async function cnipixMapDirectory() {
+  if (!window.showDirectoryPicker) throw new Error('Folder mapping requires a Chromium browser with File System Access support.');
+  cnipixRoot = await window.showDirectoryPicker({ mode: 'readwrite' });
+  cnipixFiles = [];
+  const entries = [];
+  async function walk(directory, prefix = '') {
+    for await (const [name, handle] of directory.entries()) {
+      const path = prefix ? `${prefix}/${name}` : name;
+      if (handle.kind === 'directory') { await walk(handle, path); continue; }
+      if (!name.toLowerCase().endsWith('.json')) continue;
+      try {
+        const data = JSON.parse(await (await handle.getFile()).text());
+        if (typeof data.spritesheet !== 'string' || !Array.isArray(data.anims) || !data.anims.length) continue;
+        const sheetPath = data.spritesheet.replaceAll(String.fromCharCode(92), '/');
+        const candidates = [sheetPath, sheetPath.startsWith('assets/') ? sheetPath.slice(7) : sheetPath, `${path.slice(0, path.lastIndexOf('/') + 1)}${sheetPath.split('/').pop()}`];
+        let sheet = null;
+        for (const candidate of candidates) {
+          try {
+            let parent = cnipixRoot;
+            const parts = candidate.split('/').filter(Boolean);
+            for (const part of parts.slice(0, -1)) parent = await parent.getDirectoryHandle(part);
+            sheet = await parent.getFileHandle(parts.at(-1));
+            break;
+          }
+          catch { /* try the next project-relative path */ }
+        }
+        if (!sheet) continue;
+        const animations = [];
+        try {
+          const bitmap = await createImageBitmap(await sheet.getFile());
+          const cellWidth = Number(data.width), cellHeight = Number(data.height);
+          const columns = Math.floor(bitmap.width / cellWidth);
+          for (let index = 0; index < data.anims.length; index++) {
+            const anim = data.anims[index];
+            let preview = '';
+            try {
+              const frame = Number(anim.frames?.[0] ?? 0);
+              if (cellWidth > 0 && cellHeight > 0 && columns > 0 && frame >= 0) {
+                const canvas = document.createElement('canvas');
+                canvas.width = cellWidth; canvas.height = cellHeight;
+                canvas.getContext('2d').drawImage(bitmap, (frame % columns) * cellWidth, Math.floor(frame / columns) * cellHeight, cellWidth, cellHeight, 0, 0, cellWidth, cellHeight);
+                preview = canvas.toDataURL('image/png');
+              }
+            } catch { /* the project remains openable without a thumbnail */ }
+            animations.push({ name: String(anim.name || `Animation ${index + 1}`), index, preview });
+          }
+          bitmap.close();
+        } catch {
+          for (let index = 0; index < data.anims.length; index++) {
+            const anim = data.anims[index];
+            animations.push({ name: String(anim.name || `Animation ${index + 1}`), index, preview: '' });
+          }
+        }
+        const id = cnipixFiles.push({ json: handle, sheet }) - 1;
+        entries.push({ id, path, animations });
+      } catch { /* ignore unrelated or malformed JSON files */ }
+    }
+  }
+  await walk(cnipixRoot);
+  entries.sort((a, b) => a.path.localeCompare(b.path));
+  return JSON.stringify(entries);
+}
+
+export async function cnipixReadProject(id, animationIndex) {
+  const entry = cnipixFiles[id];
+  if (!entry) throw new Error('This mapped project is no longer available. Map the directory again.');
+  const [manifest, pngFile] = await Promise.all([entry.json.getFile(), entry.sheet.getFile()]);
+  const png = new Uint8Array(await pngFile.arrayBuffer());
+  return { manifest: await manifest.text(), png, animationIndex };
+}
+
+export async function cnipixWriteProject(id, manifest, png) {
+  const entry = cnipixFiles[id];
+  if (!entry) throw new Error('This mapped project is no longer available. Map the directory again.');
+  for (const handle of [entry.json, entry.sheet]) {
+    if (!await handle.requestPermission({ mode: 'readwrite' }).then(state => state === 'granted')) {
+      throw new Error('Write permission was not granted for the mapped files.');
+    }
+  }
+  const pngBytes = new Uint8Array(png);
+  const pngWriter = await entry.sheet.createWritable();
+  await pngWriter.write(pngBytes);
+  await pngWriter.close();
+  const jsonWriter = await entry.json.createWritable();
+  await jsonWriter.write(manifest);
+  await jsonWriter.close();
+  return true;
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(catch)]
+    fn cnipixMapDirectory() -> Result<js_sys::Promise, wasm_bindgen::JsValue>;
+    #[wasm_bindgen::prelude::wasm_bindgen(catch)]
+    fn cnipixReadProject(
+        id: u32,
+        animation_index: u32,
+    ) -> Result<js_sys::Promise, wasm_bindgen::JsValue>;
+    #[wasm_bindgen::prelude::wasm_bindgen(catch)]
+    fn cnipixWriteProject(
+        id: u32,
+        manifest: &str,
+        png: &js_sys::Uint8Array,
+    ) -> Result<js_sys::Promise, wasm_bindgen::JsValue>;
 }
 
 #[derive(Serialize, Deserialize)]
@@ -113,6 +250,8 @@ fn App() -> Element {
     let mut frame_time_ms = use_signal(|| INITIAL_FRAME_TIME_MS);
     let mut selected_frame = use_signal(|| 0usize);
     let mut selected_color = use_signal(|| 2usize);
+    let mut color_editor_open = use_signal(|| false);
+    let mut new_color_value = use_signal(|| String::from("#ffffff"));
     let mut palette = use_signal(|| {
         DEFAULT_PALETTE
             .iter()
@@ -133,6 +272,10 @@ fn App() -> Element {
     let mut zoom = use_signal(|| 1.0f32);
     let mut animation_name = use_signal(|| String::from("CNIPIX_ANIMATION"));
     let mut project_label = use_signal(|| String::from("Untitled sprite"));
+    let mut directory_projects = use_signal(Vec::<MappedProject>::new);
+    let mut directory_mapped = use_signal(|| false);
+    let mut directory_browser_open = use_signal(|| false);
+    let mut active_mapping = use_signal(|| None::<ActiveMapping>);
     let mut status = use_signal(|| String::from("Ready · choose a color and draw"));
 
     let play_state = playing;
@@ -172,6 +315,15 @@ fn App() -> Element {
     let is_onion = *onion_skin.read();
     let is_playing = *playing.read();
     let is_preview_open = *preview_open.read();
+    let is_directory_browser_open = *directory_browser_open.read();
+    let mapped_projects = directory_projects.read().clone();
+    let has_mapped_projects = *directory_mapped.read();
+    let mapped_animation_count = mapped_projects
+        .iter()
+        .map(|project| project.animations.len())
+        .sum::<usize>();
+    let active_mapping_value = active_mapping.read().clone();
+    let mapped_project_active = active_mapping.read().is_some();
     let name = animation_name.read().clone();
     let frame_list = frames.read().clone();
     let current_pixels = frame_list[active].pixels.clone();
@@ -341,6 +493,12 @@ fn App() -> Element {
                     span { class: "project-size", "{w} × {h}" }
                 }
                 div { class: "topbar-actions",
+                    button { class: "button button-quiet", onclick: move |_| {
+                        directory_browser_open.set(true);
+                        if directory_projects.read().is_empty() {
+                            status.set("Choose a game or assets folder to map".to_owned());
+                        }
+                    }, "▣ Project folder" }
                     label { class: "button button-quiet load-project-button",
                         span { "↑ Load project" }
                         input {
@@ -366,7 +524,9 @@ fn App() -> Element {
                                             frame_time_ms.set(project.frame_time_ms);
                                             project_label.set(project.name.clone());
                                             animation_name.set(project.name);
+                                            palette.set(project.palette.clone());
                                             frames.set(project.frames);
+                                            active_mapping.set(None);
                                             selected_frame.set(0);
                                             playing.set(false);
                                             preview_open.set(false);
@@ -390,6 +550,33 @@ fn App() -> Element {
                         value: "{name}",
                         oninput: move |event| animation_name.set(event.value()),
                         placeholder: "Animation name"
+                    }
+                    if mapped_project_active {
+                        button { class: "button button-soft", onclick: move |_| {
+                            let Some(mapping) = active_mapping.read().clone() else { return; };
+                            let current_frames = frames.read().clone();
+                            let current_width = *width.read();
+                            let current_height = *height.read();
+                            let current_timing = *frame_time_ms.read();
+                            let current_name = animation_name.read().clone();
+                            let current_palette = palette.read().clone();
+                            match prepare_mapped_save(&mapping, &current_frames, current_width, current_height, current_timing, &current_name, &current_palette) {
+                                Ok((manifest, png)) => {
+                                    status.set("Saving changes to the mapped JSON and sprite sheet…".to_owned());
+                                    spawn(async move {
+                                        match write_mapped_project(mapping.id, &manifest, &png).await {
+                                            Ok(()) => {
+                                                let saved_frame_indices = mapped_frame_indices(&manifest, mapping.animation_index);
+                                                active_mapping.with_mut(|active| if let Some(active) = active { active.manifest = manifest; active.png = png; active.original_frame_indices = saved_frame_indices; });
+                                                status.set("Saved changes to the mapped JSON and sprite sheet".to_owned());
+                                            }
+                                            Err(error) => status.set(format!("Save failed: {error}")),
+                                        }
+                                    });
+                                }
+                                Err(error) => status.set(format!("Cannot save this edit: {error}")),
+                            }
+                        }, "↓ Save to folder" }
                     }
                     button {
                         class: "button button-primary export-button",
@@ -418,6 +605,113 @@ fn App() -> Element {
                         },
                         span { class: "download-icon", "↓" }
                         "Export game files"
+                    }
+                }
+            }
+
+            if is_directory_browser_open {
+                div { class: "project-browser-backdrop", onclick: move |_| directory_browser_open.set(false),
+                    section { class: "project-browser", onclick: move |event| event.stop_propagation(),
+                        header { class: "project-browser-header",
+                            div { strong { "Mapped projects" } span { "Open animation files from a game folder" } }
+                            div { class: "project-browser-actions",
+                                button { class: "button button-soft", onclick: move |_| {
+                                    status.set("Choose a game root or its assets folder…".to_owned());
+                                    match cnipixMapDirectory() {
+                                        Ok(promise) => {
+                                            spawn(async move {
+                                                match map_project_directory(promise).await {
+                                                    Ok(projects) => {
+                                                        let count = projects.iter().map(|project| project.animations.len()).sum::<usize>();
+                                                        directory_projects.set(projects);
+                                                        directory_mapped.set(true);
+                                                        directory_browser_open.set(false);
+                                                        status.set(format!("Mapped folder · {count} animations ready"));
+                                                    }
+                                                    Err(error) => status.set(format!("Folder mapping failed: {error}")),
+                                                }
+                                            });
+                                        }
+                                        Err(error) => status.set(format!("Folder mapping failed: {}", js_error_message(error))),
+                                    }
+                                }, "Choose folder / Remap" }
+                                button { class: "icon-button", title: "Close", onclick: move |_| directory_browser_open.set(false), "×" }
+                            }
+                        }
+                        if mapped_projects.is_empty() {
+                            div { class: "project-browser-empty",
+                                div { class: "empty-icon", "▣" }
+                                if *directory_mapped.read() {
+                                    strong { "No editable animations found" }
+                                    span { "This folder has no animation JSON files paired with a matching sprite sheet." }
+                                } else {
+                                    strong { "No folder mapped" }
+                                    span { "Choose the game folder or its assets directory. cnipix will find animation JSON files and their sprite sheets." }
+                                }
+                            }
+                        } else {
+                            div { class: "project-browser-list",
+                                for project in mapped_projects.iter() {
+                                    div { class: "mapped-project-card",
+                                        div { class: "mapped-project-file",
+                                            span { class: "file-glyph", "▤" }
+                                            div { strong { "{project.path}" } span { "{project.animations.len()} animations" } }
+                                        }
+                                        for animation in project.animations.iter() {
+                                            {
+                                                let project_id = project.id;
+                                                let source_path = project.path.clone();
+                                                let animation_index = animation.index;
+                                                let animation_label = animation.name.clone();
+                                                let display_animation = animation.name.clone();
+                                                rsx! {
+                                                    button { class: "mapped-animation-row", onclick: move |_| {
+                                                        let project_name = animation_label.clone();
+                                                        let source_path = source_path.clone();
+                                                        let project_id = project_id;
+                                                        let animation_index = animation_index;
+                                                        let import_palette = palette.read().clone();
+                                                        status.set(format!("Opening {project_name}…"));
+                                                        spawn(async move {
+                                                            match open_mapped_project(project_id, animation_index, &source_path, import_palette).await {
+                                                                Ok((project, mapping)) => {
+                                                                    width.set(project.width);
+                                                                    height.set(project.height);
+                                                                    frame_time_ms.set(project.frame_time_ms);
+                                                                    project_label.set(mapping.json_path.clone());
+                                                                    animation_name.set(project.name);
+                                                                    palette.set(project.palette.clone());
+                                                                    frames.set(project.frames);
+                                                                    selected_frame.set(0);
+                                                                    playing.set(false);
+                                                                    preview_open.set(false);
+                                                                    zoom.set(1.0);
+                                                                    selection.set(None);
+                                                                    selection_anchor.set(None);
+                                                                    selection_drag.set(None);
+                                                                    clipboard.set(None);
+                                                                    active_mapping.set(Some(mapping));
+                                                                    directory_browser_open.set(false);
+                                                                    status.set(format!("Opened {project_name} · edits can be saved to the mapped files"));
+                                                                }
+                                                                Err(error) => status.set(format!("Could not open project: {error}")),
+                                                            }
+                                                        });
+                                                    },
+                                                        span { class: "mapped-animation-name", "▶ {display_animation}" }
+                                                        span { class: "mapped-open-label", "Open →" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        footer { class: "project-browser-footer",
+                            span { "Choose a project to load it into the editor. Saving writes the JSON and PNG back into this folder." }
+                            if mapped_project_active { span { class: "mapped-ready", "● Active project is mapped" } }
+                        }
                     }
                 }
             }
@@ -485,7 +779,76 @@ fn App() -> Element {
                 }
             }
 
-            section { class: "editor-layout",
+            section { class: if has_mapped_projects { "editor-layout with-projects" } else { "editor-layout" },
+                if has_mapped_projects {
+                    aside { class: "project-sidebar",
+                        div { class: "project-sidebar-heading",
+                            strong { "PROJECTS" }
+                            button { class: "project-remap", title: "Map another folder", onclick: move |_| directory_browser_open.set(true), "↻" }
+                        }
+                        div { class: "project-sidebar-list",
+                            if mapped_projects.is_empty() {
+                                div { class: "project-sidebar-empty", "No matching animation JSON + PNG pairs found." }
+                            }
+                            for project in mapped_projects.iter() {
+                                section { class: "project-sidebar-group",
+                                    div { class: "project-sidebar-path", title: "{project.path}", "{project.path}" }
+                                    for animation in project.animations.iter() {
+                                        {
+                                            let project_id = project.id;
+                                            let source_path = project.path.clone();
+                                            let animation_index = animation.index;
+                                            let animation_label = animation.name.clone();
+                                            let import_palette = palette.read().clone();
+                                            let is_active = active_mapping_value.as_ref().is_some_and(|active| active.id == project_id && active.animation_index == animation_index);
+                                            rsx! {
+                                                button { class: if is_active { "project-sidebar-item active" } else { "project-sidebar-item" }, title: "{animation_label}", onclick: move |_| {
+                                                    let project_name = animation_label.clone();
+                                                    let source_path = source_path.clone();
+                                                    let import_palette = import_palette.clone();
+                                                    status.set(format!("Opening {project_name}…"));
+                                                    spawn(async move {
+                                                        match open_mapped_project(project_id, animation_index, &source_path, import_palette).await {
+                                                            Ok((project, mapping)) => {
+                                                                width.set(project.width);
+                                                                height.set(project.height);
+                                                                frame_time_ms.set(project.frame_time_ms);
+                                                                project_label.set(mapping.json_path.clone());
+                                                                animation_name.set(project.name);
+                                                                palette.set(project.palette.clone());
+                                                                frames.set(project.frames);
+                                                                selected_frame.set(0);
+                                                                playing.set(false);
+                                                                preview_open.set(false);
+                                                                zoom.set(1.0);
+                                                                selection.set(None);
+                                                                selection_anchor.set(None);
+                                                                selection_drag.set(None);
+                                                                clipboard.set(None);
+                                                                tool.set(Tool::Pencil);
+                                                                active_mapping.set(Some(mapping));
+                                                                status.set(format!("Opened {project_name} · edits can be saved to the mapped files"));
+                                                            }
+                                                            Err(error) => status.set(format!("Could not open project: {error}")),
+                                                        }
+                                                    });
+                                                },
+                                                    if animation.preview.is_empty() {
+                                                        div { class: "project-sidebar-thumbnail empty-thumb", "◇" }
+                                                    } else {
+                                                        img { class: "project-sidebar-thumbnail", src: "{animation.preview}", alt: "First frame preview" }
+                                                    }
+                                                    span { class: "project-sidebar-name", "{animation.name}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "project-sidebar-footer", "{mapped_animation_count} animations" }
+                    }
+                }
                 aside { class: "sidebar",
                     section { class: "side-section palette-section",
                         div { class: "section-heading", span { "Palette" } span { class: "section-hint", "{current_palette.len() - 1} colors" } }
@@ -541,6 +904,68 @@ fn App() -> Element {
                                     title: if index == 0 { "0 · Transparent / erase".to_owned() } else if index <= 9 { format!("{index} · Palette color {index}") } else { format!("Palette color {index}") },
                                     onclick: move |_| selected_color.set(index),
                                     if index == 0 { span { class: "clear-mark", "×" } }
+                                }
+                            }
+                            button {
+                                class: "swatch add-color-swatch",
+                                title: "Add a palette color",
+                                disabled: current_palette.len() >= 256,
+                                onclick: move |_| {
+                                    if palette.read().len() >= 256 {
+                                        status.set("The palette can contain at most 255 opaque colors".to_owned());
+                                        return;
+                                    }
+                                    new_color_value.set(if selected > 0 { palette.read()[selected].clone() } else { "#ffffff".to_owned() });
+                                    color_editor_open.set(true);
+                                },
+                                span { "+" }
+                            }
+                        }
+                        if *color_editor_open.read() {
+                            div { class: "palette-color-editor",
+                                strong { "Add palette color" }
+                                div { class: "palette-color-controls",
+                                    input {
+                                        class: "native-color-picker",
+                                        r#type: "color",
+                                        value: "{new_color_value}",
+                                        oninput: move |event| new_color_value.set(event.value()),
+                                        aria_label: "Choose a color"
+                                    }
+                                    input {
+                                        class: "custom-color-input",
+                                        r#type: "text",
+                                        value: "{new_color_value}",
+                                        placeholder: "#RRGGBB or rgb(…)",
+                                        oninput: move |event| new_color_value.set(event.value()),
+                                        aria_label: "Color as hex or RGB"
+                                    }
+                                }
+                                div { class: "palette-color-actions",
+                                    button { class: "button button-quiet", onclick: move |_| color_editor_open.set(false), "Cancel" }
+                                    button { class: "button button-primary", onclick: move |_| {
+                                        match parse_color_input(&new_color_value.read()) {
+                                            Ok(color) => {
+                                                let existing = palette.read().iter().enumerate().skip(1)
+                                                    .find(|(_, entry)| entry.eq_ignore_ascii_case(&color))
+                                                    .map(|(index, _)| index);
+                                                let index = if let Some(index) = existing {
+                                                    index
+                                                } else if palette.read().len() < 256 {
+                                                    let index = palette.read().len();
+                                                    palette.with_mut(|colors| colors.push(color.clone()));
+                                                    index
+                                                } else {
+                                                    status.set("The palette can contain at most 255 opaque colors".to_owned());
+                                                    return;
+                                                };
+                                                selected_color.set(index);
+                                                color_editor_open.set(false);
+                                                status.set(format!("Selected palette color {color}"));
+                                            }
+                                            Err(error) => status.set(error),
+                                        }
+                                    }, "Add color" }
                                 }
                             }
                         }
@@ -786,10 +1211,208 @@ async fn load_project_files(
     load_project(&manifest, &sheet_bytes, &palette)
 }
 
+async fn map_project_directory(promise: js_sys::Promise) -> Result<Vec<MappedProject>, String> {
+    use wasm_bindgen_futures::JsFuture;
+    let result = JsFuture::from(promise).await.map_err(js_error_message)?;
+    let json = result
+        .as_string()
+        .ok_or("folder scan returned invalid data")?;
+    serde_json::from_str(&json).map_err(|error| format!("could not read folder index: {error}"))
+}
+
+async fn open_mapped_project(
+    id: u32,
+    animation_index: usize,
+    path: &str,
+    palette: Vec<String>,
+) -> Result<(LoadedProject, ActiveMapping), String> {
+    use wasm_bindgen_futures::JsFuture;
+    let result =
+        JsFuture::from(cnipixReadProject(id, animation_index as u32).map_err(js_error_message)?)
+            .await
+            .map_err(js_error_message)?;
+    let manifest_text = js_sys::Reflect::get(&result, &"manifest".into())
+        .map_err(js_error_message)?
+        .as_string()
+        .ok_or("could not read the mapped JSON")?;
+    let png_value = js_sys::Reflect::get(&result, &"png".into()).map_err(js_error_message)?;
+    let png = js_sys::Uint8Array::new(&png_value).to_vec();
+    let manifest: ProjectManifest = serde_json::from_str(&manifest_text)
+        .map_err(|error| format!("invalid animation JSON: {error}"))?;
+    let animation = manifest
+        .anims
+        .get(animation_index)
+        .ok_or("the requested animation does not exist")?;
+    let mapping = ActiveMapping {
+        id,
+        animation_index,
+        json_path: path.to_owned(),
+        manifest: manifest_text,
+        png: png.clone(),
+        original_frame_indices: animation.frames.clone(),
+        original_width: manifest.width,
+        original_height: manifest.height,
+    };
+    let project = load_project_animation(&manifest, &png, &palette, animation_index)?;
+    Ok((project, mapping))
+}
+
+async fn write_mapped_project(id: u32, manifest: &str, png: &[u8]) -> Result<(), String> {
+    use wasm_bindgen_futures::JsFuture;
+    let bytes = js_sys::Uint8Array::from(png);
+    JsFuture::from(cnipixWriteProject(id, manifest, &bytes).map_err(js_error_message)?)
+        .await
+        .map_err(js_error_message)?;
+    Ok(())
+}
+
+fn js_error_message(error: wasm_bindgen::JsValue) -> String {
+    error.as_string().unwrap_or_else(|| format!("{error:?}"))
+}
+
+fn mapped_frame_indices(manifest: &str, animation_index: usize) -> Vec<usize> {
+    serde_json::from_str::<serde_json::Value>(manifest)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("anims")?
+                .get(animation_index)?
+                .get("frames")?
+                .as_array()
+                .cloned()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|value| value.as_u64().map(|index| index as usize))
+        .collect()
+}
+
+fn prepare_mapped_save(
+    mapping: &ActiveMapping,
+    frames: &[Frame],
+    width: usize,
+    height: usize,
+    frame_time_ms: u32,
+    animation_name: &str,
+    palette: &[String],
+) -> Result<(String, Vec<u8>), String> {
+    if width != mapping.original_width || height != mapping.original_height {
+        return Err(
+            "changing the cell width or height for a mapped sprite sheet is not supported yet"
+                .to_owned(),
+        );
+    }
+    if frames.is_empty() {
+        return Err("an animation must have at least one frame".to_owned());
+    }
+    let mut manifest: serde_json::Value = serde_json::from_str(&mapping.manifest)
+        .map_err(|error| format!("invalid animation JSON: {error}"))?;
+    let anim = manifest
+        .get_mut("anims")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|anims| anims.get_mut(mapping.animation_index))
+        .ok_or("the mapped animation no longer exists in the JSON")?;
+    let mut decoder = png::Decoder::new(Cursor::new(&mapping.png));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("could not decode mapped sprite sheet: {error}"))?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buffer)
+        .map_err(|error| format!("could not read mapped sprite sheet: {error}"))?;
+    let sheet_width = info.width as usize;
+    let sheet_height = info.height as usize;
+    if sheet_width % width != 0 || sheet_height % height != 0 {
+        return Err("mapped sprite sheet dimensions no longer match the cell size".to_owned());
+    }
+    let source = png_to_rgba(&buffer[..info.buffer_size()], info.color_type)?;
+    let columns = sheet_width / width;
+    let cell_count = (sheet_width / width) * (sheet_height / height);
+    if mapping
+        .original_frame_indices
+        .iter()
+        .any(|&index| index >= cell_count)
+    {
+        return Err("the mapped animation refers to a frame outside its sprite sheet".to_owned());
+    }
+    let mut frame_indices = Vec::with_capacity(frames.len());
+    for frame in 0..frames.len() {
+        frame_indices.push(
+            if let Some(&index) = mapping.original_frame_indices.get(frame) {
+                index
+            } else {
+                cell_count + frame - mapping.original_frame_indices.len()
+            },
+        );
+    }
+    let required_rows = frame_indices
+        .iter()
+        .map(|index| index / columns + 1)
+        .max()
+        .unwrap_or(1);
+    let out_height = required_rows.max(sheet_height / height) * height;
+    let mut rgba = vec![0; sheet_width * out_height * 4];
+    rgba[..source.len()].copy_from_slice(&source);
+    for (frame, &frame_index) in frames.iter().zip(frame_indices.iter()) {
+        let origin_x = (frame_index % columns) * width;
+        let origin_y = (frame_index / columns) * height;
+        for y in 0..height {
+            for x in 0..width {
+                let color_index = frame.pixels[y * width + x] as usize;
+                let offset = ((origin_y + y) * sheet_width + origin_x + x) * 4;
+                if color_index == 0 {
+                    rgba[offset..offset + 4].fill(0);
+                } else {
+                    let hex = u32::from_str_radix(palette[color_index].trim_start_matches('#'), 16)
+                        .map_err(|error| format!("invalid palette color: {error}"))?;
+                    rgba[offset] = ((hex >> 16) & 0xff) as u8;
+                    rgba[offset + 1] = ((hex >> 8) & 0xff) as u8;
+                    rgba[offset + 2] = (hex & 0xff) as u8;
+                    rgba[offset + 3] = 255;
+                }
+            }
+        }
+    }
+    anim["name"] = serde_json::Value::String(if animation_name.trim().is_empty() {
+        "CNIPIX_ANIMATION".to_owned()
+    } else {
+        animation_name.trim().to_owned()
+    });
+    anim["frametime"] = serde_json::Value::from(frame_time_ms as f64 / 1000.0);
+    anim["frames"] = serde_json::Value::Array(
+        frame_indices
+            .iter()
+            .map(|index| serde_json::Value::from(*index))
+            .collect(),
+    );
+    let mut png = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut png, sheet_width as u32, out_height as u32);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+        writer
+            .write_image_data(&rgba)
+            .map_err(|error| error.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?;
+    Ok((json, png))
+}
+
 fn load_project(
     manifest: &ProjectManifest,
     png_bytes: &[u8],
     palette: &[String],
+) -> Result<LoadedProject, String> {
+    load_project_animation(manifest, png_bytes, palette, 0)
+}
+
+fn load_project_animation(
+    manifest: &ProjectManifest,
+    png_bytes: &[u8],
+    palette: &[String],
+    animation_index: usize,
 ) -> Result<LoadedProject, String> {
     if manifest.width == 0
         || manifest.height == 0
@@ -802,10 +1425,10 @@ fn load_project(
     }
     let animation = manifest
         .anims
-        .first()
-        .ok_or("the JSON file does not contain any animations")?;
+        .get(animation_index)
+        .ok_or("the requested animation does not exist")?;
     if animation.frames.is_empty() {
-        return Err("the first animation does not contain any frames".to_owned());
+        return Err("this animation does not contain any frames".to_owned());
     }
 
     let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
@@ -834,6 +1457,16 @@ fn load_project(
     let columns = sheet_width / manifest.width;
     let rows = sheet_height / manifest.height;
     let cell_count = columns * rows;
+    let mut project_palette = palette.to_vec();
+    if project_palette.is_empty() {
+        project_palette.push("#171923".to_owned());
+    }
+    let mut color_indices = HashMap::new();
+    for (index, color) in project_palette.iter().enumerate().skip(1) {
+        if let Ok(rgb) = u32::from_str_radix(color.trim_start_matches('#'), 16) {
+            color_indices.entry(rgb).or_insert(index as u8);
+        }
+    }
     let mut frames = Vec::with_capacity(animation.frames.len());
     for &frame_index in &animation.frames {
         if frame_index >= cell_count {
@@ -848,11 +1481,23 @@ fn load_project(
             for x in 0..manifest.width {
                 let offset = ((origin_y + y) * sheet_width + origin_x + x) * 4;
                 let rgba = &pixels[offset..offset + 4];
-                frame_pixels.push(if rgba[3] < 128 {
-                    0
+                if rgba[3] < 128 {
+                    frame_pixels.push(0);
                 } else {
-                    nearest_palette_color(rgba[0], rgba[1], rgba[2], palette)
-                });
+                    let rgb = ((rgba[0] as u32) << 16) | ((rgba[1] as u32) << 8) | rgba[2] as u32;
+                    let index = if let Some(index) = color_indices.get(&rgb) {
+                        *index
+                    } else {
+                        if project_palette.len() >= 256 {
+                            return Err("this animation uses more than 255 opaque colors; simplify its palette before importing".to_owned());
+                        }
+                        let index = project_palette.len() as u8;
+                        project_palette.push(format!("#{rgb:06x}"));
+                        color_indices.insert(rgb, index);
+                        index
+                    };
+                    frame_pixels.push(index);
+                }
             }
         }
         frames.push(Frame {
@@ -867,6 +1512,7 @@ fn load_project(
         frame_time_ms,
         frames,
         animation_count: manifest.anims.len(),
+        palette: project_palette,
     })
 }
 
@@ -912,6 +1558,80 @@ fn nearest_palette_color(red: u8, green: u8, blue: u8, palette: &[String]) -> u8
         }
     }
     nearest.1
+}
+
+fn parse_color_input(input: &str) -> Result<String, String> {
+    let value = input.trim().to_ascii_lowercase();
+    if let Some(hex) = value.strip_prefix('#') {
+        if !hex.chars().all(|digit| digit.is_ascii_hexdigit()) {
+            return Err("hex colors may contain only digits 0–9 and letters A–F".to_owned());
+        }
+        let rgb = match hex.len() {
+            3 => hex
+                .chars()
+                .map(|digit| format!("{digit}{digit}"))
+                .collect::<String>(),
+            4 if hex.ends_with('f') => hex[..3]
+                .chars()
+                .map(|digit| format!("{digit}{digit}"))
+                .collect::<String>(),
+            6 => hex.to_owned(),
+            8 if hex.ends_with("ff") => hex[..6].to_owned(),
+            4 | 8 => return Err("palette colors must be fully opaque".to_owned()),
+            _ => return Err("use #RGB, #RRGGBB, or an rgb() color".to_owned()),
+        };
+        if u32::from_str_radix(&rgb, 16).is_err() {
+            return Err("hex colors may contain only digits 0–9 and letters A–F".to_owned());
+        }
+        return Ok(format!("#{rgb}"));
+    }
+
+    let open = value
+        .find('(')
+        .ok_or("use #RGB, #RRGGBB, rgb(), or opaque rgba()")?;
+    let function = value[..open].trim();
+    if function != "rgb" && function != "rgba" {
+        return Err("use #RGB, #RRGGBB, rgb(), or opaque rgba()".to_owned());
+    }
+    let body = value[open + 1..]
+        .strip_suffix(')')
+        .ok_or("RGB color is missing its closing parenthesis")?;
+    let channels = body
+        .replace(',', " ")
+        .replace('/', " ")
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if channels.len() != 3 && channels.len() != 4 {
+        return Err("rgb() needs three channels; rgba() may include an alpha of 1".to_owned());
+    }
+    if function == "rgba" && channels.len() != 4 {
+        return Err("rgba() needs an alpha channel".to_owned());
+    }
+    if (function == "rgba" || channels.len() == 4)
+        && !matches!(channels[3].as_str(), "1" | "1.0" | "1.00" | "100%")
+    {
+        return Err("palette colors must be fully opaque (alpha 1)".to_owned());
+    }
+    let mut rgb = String::with_capacity(6);
+    for channel in channels.iter().take(3) {
+        let number = if let Some(percent) = channel.strip_suffix('%') {
+            let percent = percent
+                .parse::<f32>()
+                .map_err(|_| "RGB percentages must be between 0% and 100%")?;
+            if !(0.0..=100.0).contains(&percent) {
+                return Err("RGB percentages must be between 0% and 100%".to_owned());
+            }
+            (percent * 255.0 / 100.0).round() as u8
+        } else {
+            let number = channel
+                .parse::<u16>()
+                .map_err(|_| "RGB channels must be integers from 0 to 255")?;
+            u8::try_from(number).map_err(|_| "RGB channels must be integers from 0 to 255")?
+        };
+        write!(rgb, "{number:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(format!("#{rgb}"))
 }
 
 fn parse_palette_file(contents: &str) -> Result<Vec<String>, String> {

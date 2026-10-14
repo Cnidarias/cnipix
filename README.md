@@ -48,7 +48,9 @@ The exported sprite path is `assets/player/cnipix_spritesheet.png`.
 
 ## Load a project
 
-Choose **Load project** and select the matching animation JSON and PNG sprite sheet together. The editor loads the first animation listed in the JSON. Imported colors are matched to the closest cnipix palette color, and transparent pixels remain transparent.
+Choose **Load project** and select the matching animation JSON and PNG sprite sheet together. The editor loads the first animation listed in the JSON. Opaque RGB colors used by the imported frames are added to the working palette and kept exactly; transparent pixels remain transparent. The editor supports up to 255 opaque colors per loaded project.
+
+Choose **Project folder** to map a game folder or its `assets` directory. The project browser finds animation JSON files with a matching sprite sheet and lists every animation in each file. Choose an animation to open it, then use **Save to folder** to write edits back to its JSON and PNG. Saving preserves the other animations and sprite sheet cells in those files. Folder mapping and direct saving require a Chromium based browser with File System Access support. A mapped sprite's cell width and height must stay the same while saving; use **Export game files** for a resized copy.
 
 ## Palettes
 
