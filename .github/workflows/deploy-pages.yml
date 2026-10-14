@@ -1,0 +1,75 @@
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Rust and WebAssembly target
+        uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install native build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends pkg-config libssl-dev
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Dioxus CLI
+        run: cargo install dioxus-cli --version 0.7.10 --locked
+
+      - name: Set GitHub Pages subpath
+        run: sed -i '/^\[web\.app\]/a base_path = "cnipix"' Dioxus.toml
+
+      - name: Build web app
+        run: dx build --release --platform web
+
+      - name: Prepare Pages artifact
+        run: |
+          mkdir -p _site
+          cp -R target/dx/cnipix/release/web/public/. _site/
+          cp _site/index.html _site/404.html
+          touch _site/.nojekyll
+
+      - name: Configure GitHub Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

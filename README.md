@@ -26,6 +26,10 @@ Open `http://localhost:8080`. Set `CNIPIX_PORT` to change the host port, for exa
 
 The GitHub Actions workflow builds the image for pull requests and publishes it to GitHub Container Registry on pushes to the default branch and on version tags (`v*`). The image is `ghcr.io/cnidarias/cnipix`; the default branch publishes the `latest` tag. After the first publish, make the package public in its GitHub Packages settings if it is not already public.
 
+## Publish with GitHub Pages
+
+The **Deploy GitHub Pages** workflow builds on pushes to `main` or `master` and deploys from the repository's default branch. In the repository, open **Settings → Pages** and set **Build and deployment → Source** to **GitHub Actions**. Then push or merge to the default branch; the site will be available at `https://cnidarias.github.io/cnipix/`.
+
 ## Editing
 
 - Draw with click or pointer-drag using the palette. Palette slot zero clears pixels and exports transparent alpha.
