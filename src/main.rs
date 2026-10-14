@@ -22,6 +22,23 @@ struct Frame {
     pixels: Vec<u8>,
 }
 
+#[derive(Clone, PartialEq)]
+struct DocumentSnapshot {
+    frames: Vec<Frame>,
+    width: usize,
+    height: usize,
+    palette: Vec<String>,
+    selected_frame: usize,
+}
+
+#[derive(Default)]
+struct History {
+    undo: Vec<DocumentSnapshot>,
+    redo: Vec<DocumentSnapshot>,
+}
+
+const HISTORY_LIMIT: usize = 100;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Tool {
     Pencil,
@@ -245,6 +262,7 @@ fn App() -> Element {
             pixels: vec![0; INITIAL_WIDTH * INITIAL_HEIGHT],
         }]
     });
+    let mut history = use_signal(History::default);
     let mut width = use_signal(|| INITIAL_WIDTH);
     let mut height = use_signal(|| INITIAL_HEIGHT);
     let mut frame_time_ms = use_signal(|| INITIAL_FRAME_TIME_MS);
@@ -311,6 +329,8 @@ fn App() -> Element {
     let active_tool = *tool.read();
     let selected_region = *selection.read();
     let clipboard_available = clipboard.read().is_some();
+    let can_undo = !history.read().undo.is_empty();
+    let can_redo = !history.read().redo.is_empty();
     let zoom_level = *zoom.read();
     let is_onion = *onion_skin.read();
     let is_playing = *playing.read();
@@ -370,6 +390,24 @@ fn App() -> Element {
                 let key = keyboard.key().to_ascii_lowercase();
                 if keyboard.ctrl_key() || keyboard.meta_key() {
                     match key.as_str() {
+                        "z" if keyboard.shift_key() => {
+                            event.prevent_default();
+                            if redo_document(&mut history, &mut frames, &mut width, &mut height, &mut frame_time_ms, &mut palette, &mut animation_name, &mut selected_frame) {
+                                status.set("Redo".to_owned());
+                            }
+                        }
+                        "z" => {
+                            event.prevent_default();
+                            if undo_document(&mut history, &mut frames, &mut width, &mut height, &mut frame_time_ms, &mut palette, &mut animation_name, &mut selected_frame) {
+                                status.set("Undo".to_owned());
+                            }
+                        }
+                        "y" => {
+                            event.prevent_default();
+                            if redo_document(&mut history, &mut frames, &mut width, &mut height, &mut frame_time_ms, &mut palette, &mut animation_name, &mut selected_frame) {
+                                status.set("Redo".to_owned());
+                            }
+                        }
                         "c" => {
                             event.prevent_default();
                             if let Some(region) = *selection.read() {
@@ -385,6 +423,7 @@ fn App() -> Element {
                             event.prevent_default();
                             if let Some(copy) = clipboard.read().clone() {
                                 if let Some(index) = *hovered_pixel.read() {
+                                    record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame);
                                     let frame = *selected_frame.read();
                                     let canvas_width = *width.read();
                                     let region = paste_clipboard(
@@ -441,6 +480,7 @@ fn App() -> Element {
                     "delete" | "backspace" => {
                         if let Some(region) = *selection.read() {
                             event.prevent_default();
+                            record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame);
                             let frame = *selected_frame.read();
                             let canvas_width = *width.read();
                             frames.with_mut(|all| {
@@ -526,6 +566,7 @@ fn App() -> Element {
                                             animation_name.set(project.name);
                                             palette.set(project.palette.clone());
                                             frames.set(project.frames);
+                                            history.set(History::default());
                                             active_mapping.set(None);
                                             selected_frame.set(0);
                                             playing.set(false);
@@ -682,6 +723,7 @@ fn App() -> Element {
                                                                     animation_name.set(project.name);
                                                                     palette.set(project.palette.clone());
                                                                     frames.set(project.frames);
+                                                                    history.set(History::default());
                                                                     selected_frame.set(0);
                                                                     playing.set(false);
                                                                     preview_open.set(false);
@@ -718,13 +760,17 @@ fn App() -> Element {
 
             section { class: "toolbar",
                 div { class: "tool-group",
+                    button { class: "button button-quiet", disabled: !can_undo, title: "Undo (Ctrl/⌘+Z)", onclick: move |_| { if undo_document(&mut history, &mut frames, &mut width, &mut height, &mut frame_time_ms, &mut palette, &mut animation_name, &mut selected_frame) { status.set("Undo".to_owned()); } }, "↶ Undo" }
+                    button { class: "button button-quiet", disabled: !can_redo, title: "Redo (Ctrl/⌘+Y or Ctrl/⌘+Shift+Z)", onclick: move |_| { if redo_document(&mut history, &mut frames, &mut width, &mut height, &mut frame_time_ms, &mut palette, &mut animation_name, &mut selected_frame) { status.set("Redo".to_owned()); } }, "↷ Redo" }
                     button { class: "button button-soft", onclick: move |_| {
+                        record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame);
                         let at = *selected_frame.read() + 1;
                         frames.with_mut(|items| items.insert(at, Frame { pixels: vec![0; *width.read() * *height.read()] }));
                         selected_frame.set(at);
                         playing.set(false);
                     }, span { class: "plus-icon", "+" } "New frame" }
                     button { class: "button button-quiet", onclick: move |_| {
+                        record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame);
                         let at = *selected_frame.read() + 1;
                         let copy = frames.read()[*selected_frame.read()].clone();
                         frames.with_mut(|items| items.insert(at, copy));
@@ -817,6 +863,7 @@ fn App() -> Element {
                                                                 animation_name.set(project.name);
                                                                 palette.set(project.palette.clone());
                                                                 frames.set(project.frames);
+                                                                history.set(History::default());
                                                                 selected_frame.set(0);
                                                                 playing.set(false);
                                                                 preview_open.set(false);
@@ -867,6 +914,7 @@ fn App() -> Element {
                                                     Ok(contents) => match parse_palette_file(&contents) {
                                                         Ok(new_palette) => {
                                                             let old_palette = palette.read().clone();
+                                                            record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame);
                                                             frames.with_mut(|all| remap_frames_palette(all, &old_palette, &new_palette));
                                                             let next_selected = (*selected_color.read()).min(new_palette.len() - 1);
                                                             selected_color.set(next_selected);
@@ -981,28 +1029,28 @@ fn App() -> Element {
                         div { class: "stepper",
                             button { class: "stepper-button", onclick: move |_| {
                                 let old_w = *width.read();
-                                if old_w > 1 { let new_w = old_w - 1; resize_frames(&mut frames, old_w, *height.read(), new_w, *height.read()); width.set(new_w); }
+                                if old_w > 1 { record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame); let new_w = old_w - 1; resize_frames(&mut frames, old_w, *height.read(), new_w, *height.read()); width.set(new_w); }
                             }, "−" }
                             input { class: "number-input", r#type: "number", min: "1", max: "64", value: "{w}", oninput: move |event| {
-                                if let Ok(next) = event.value().parse::<usize>() { let next = next.clamp(1, CELL_LIMIT); let old = *width.read(); if old != next { resize_frames(&mut frames, old, *height.read(), next, *height.read()); width.set(next); } }
+                                if let Ok(next) = event.value().parse::<usize>() { let next = next.clamp(1, CELL_LIMIT); let old = *width.read(); if old != next { record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame); resize_frames(&mut frames, old, *height.read(), next, *height.read()); width.set(next); } }
                             } }
                             button { class: "stepper-button", onclick: move |_| {
                                 let old_w = *width.read();
-                                if old_w < CELL_LIMIT { let new_w = old_w + 1; resize_frames(&mut frames, old_w, *height.read(), new_w, *height.read()); width.set(new_w); }
+                                if old_w < CELL_LIMIT { record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame); let new_w = old_w + 1; resize_frames(&mut frames, old_w, *height.read(), new_w, *height.read()); width.set(new_w); }
                             }, "+" }
                         }
                         label { class: "field-label field-label-spaced", "Height" }
                         div { class: "stepper",
                             button { class: "stepper-button", onclick: move |_| {
                                 let old_h = *height.read();
-                                if old_h > 1 { let new_h = old_h - 1; resize_frames(&mut frames, *width.read(), old_h, *width.read(), new_h); height.set(new_h); }
+                                if old_h > 1 { record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame); let new_h = old_h - 1; resize_frames(&mut frames, *width.read(), old_h, *width.read(), new_h); height.set(new_h); }
                             }, "−" }
                             input { class: "number-input", r#type: "number", min: "1", max: "64", value: "{h}", oninput: move |event| {
-                                if let Ok(next) = event.value().parse::<usize>() { let next = next.clamp(1, CELL_LIMIT); let old = *height.read(); if old != next { resize_frames(&mut frames, *width.read(), old, *width.read(), next); height.set(next); } }
+                                if let Ok(next) = event.value().parse::<usize>() { let next = next.clamp(1, CELL_LIMIT); let old = *height.read(); if old != next { record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame); resize_frames(&mut frames, *width.read(), old, *width.read(), next); height.set(next); } }
                             } }
                             button { class: "stepper-button", onclick: move |_| {
                                 let old_h = *height.read();
-                                if old_h < CELL_LIMIT { let new_h = old_h + 1; resize_frames(&mut frames, *width.read(), old_h, *width.read(), new_h); height.set(new_h); }
+                                if old_h < CELL_LIMIT { record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame); let new_h = old_h + 1; resize_frames(&mut frames, *width.read(), old_h, *width.read(), new_h); height.set(new_h); }
                             }, "+" }
                         }
                     }
@@ -1056,6 +1104,7 @@ fn App() -> Element {
                                     ghost: previous_pixels.as_ref().map(|pixels| pixels[index]).unwrap_or(0),
                                     onion: is_onion,
                                     frames,
+                                    history,
                                     selected_frame,
                                     selected_color,
                                     palette,
@@ -1068,6 +1117,10 @@ fn App() -> Element {
                                     clipboard,
                                     hovered_pixel,
                                     height: h,
+                                    width_state: width,
+                                    height_state: height,
+                                    frame_time_ms,
+                                    animation_name,
                                 }
                             }
                         }
@@ -1084,7 +1137,7 @@ fn App() -> Element {
                     div { class: "timeline-title", strong { "Timeline" } span { "{frame_list.len()} frames" } }
                     div { class: "timeline-actions",
                         button { class: "button button-quiet small-button", onclick: move |_| {
-                            if frames.read().len() > 1 { let remove = *selected_frame.read(); frames.with_mut(|items| { items.remove(remove); }); selected_frame.set(remove.min(frames.read().len() - 1)); }
+                            if frames.read().len() > 1 { record_document(&mut history, &frames, &width, &height, &frame_time_ms, &palette, &animation_name, &selected_frame); let remove = *selected_frame.read(); frames.with_mut(|items| { items.remove(remove); }); selected_frame.set(remove.min(frames.read().len() - 1)); }
                         }, "Delete frame" }
                     }
                 }
@@ -1131,7 +1184,7 @@ fn App() -> Element {
             }
             footer { class: "statusbar",
                 span { class: "status-ready", span { class: "live-dot" } "{status}" }
-                span { class: "status-shortcuts", "Erase: right click · Tools: B / M / G · Colors: 0–9 · Copy / paste: Ctrl+C / Ctrl+V" }
+                span { class: "status-shortcuts", "Undo / redo: Ctrl+Z / Ctrl+Y · Erase: right click · Tools: B / M / G" }
                 span { class: "status-version", "cnipix  ·  browser edition" }
             }
         }
@@ -1142,6 +1195,146 @@ fn App() -> Element {
 fn FrameNumber(number: usize) -> Element {
     let label = format!("{number:02}");
     rsx! { span { "{label}" } }
+}
+
+fn document_snapshot(
+    frames: &Signal<Vec<Frame>>,
+    width: &Signal<usize>,
+    height: &Signal<usize>,
+    _frame_time_ms: &Signal<u32>,
+    palette: &Signal<Vec<String>>,
+    _animation_name: &Signal<String>,
+    selected_frame: &Signal<usize>,
+) -> DocumentSnapshot {
+    DocumentSnapshot {
+        frames: frames.read().clone(),
+        width: *width.read(),
+        height: *height.read(),
+        palette: palette.read().clone(),
+        selected_frame: *selected_frame.read(),
+    }
+}
+
+fn record_document(
+    history: &mut Signal<History>,
+    frames: &Signal<Vec<Frame>>,
+    width: &Signal<usize>,
+    height: &Signal<usize>,
+    frame_time_ms: &Signal<u32>,
+    palette: &Signal<Vec<String>>,
+    animation_name: &Signal<String>,
+    selected_frame: &Signal<usize>,
+) {
+    let snapshot = document_snapshot(
+        frames,
+        width,
+        height,
+        frame_time_ms,
+        palette,
+        animation_name,
+        selected_frame,
+    );
+    history.with_mut(|history| {
+        history.undo.push(snapshot);
+        if history.undo.len() > HISTORY_LIMIT {
+            history.undo.remove(0);
+        }
+        history.redo.clear();
+    });
+}
+
+fn undo_document(
+    history: &mut Signal<History>,
+    frames: &mut Signal<Vec<Frame>>,
+    width: &mut Signal<usize>,
+    height: &mut Signal<usize>,
+    _frame_time_ms: &mut Signal<u32>,
+    palette: &mut Signal<Vec<String>>,
+    _animation_name: &mut Signal<String>,
+    selected_frame: &mut Signal<usize>,
+) -> bool {
+    let Some(previous) = history.with_mut(|history| history.undo.pop()) else {
+        return false;
+    };
+    let current = document_snapshot(
+        frames,
+        width,
+        height,
+        _frame_time_ms,
+        palette,
+        _animation_name,
+        selected_frame,
+    );
+    history.with_mut(|history| history.redo.push(current));
+    restore_document(
+        previous,
+        frames,
+        width,
+        height,
+        _frame_time_ms,
+        palette,
+        _animation_name,
+        selected_frame,
+    );
+    true
+}
+
+fn redo_document(
+    history: &mut Signal<History>,
+    frames: &mut Signal<Vec<Frame>>,
+    width: &mut Signal<usize>,
+    height: &mut Signal<usize>,
+    _frame_time_ms: &mut Signal<u32>,
+    palette: &mut Signal<Vec<String>>,
+    _animation_name: &mut Signal<String>,
+    selected_frame: &mut Signal<usize>,
+) -> bool {
+    let Some(next) = history.with_mut(|history| history.redo.pop()) else {
+        return false;
+    };
+    let current = document_snapshot(
+        frames,
+        width,
+        height,
+        _frame_time_ms,
+        palette,
+        _animation_name,
+        selected_frame,
+    );
+    history.with_mut(|history| {
+        history.undo.push(current);
+        if history.undo.len() > HISTORY_LIMIT {
+            history.undo.remove(0);
+        }
+    });
+    restore_document(
+        next,
+        frames,
+        width,
+        height,
+        _frame_time_ms,
+        palette,
+        _animation_name,
+        selected_frame,
+    );
+    true
+}
+
+fn restore_document(
+    snapshot: DocumentSnapshot,
+    frames: &mut Signal<Vec<Frame>>,
+    width: &mut Signal<usize>,
+    height: &mut Signal<usize>,
+    _frame_time_ms: &mut Signal<u32>,
+    palette: &mut Signal<Vec<String>>,
+    _animation_name: &mut Signal<String>,
+    selected_frame: &mut Signal<usize>,
+) {
+    frames.set(snapshot.frames);
+    width.set(snapshot.width);
+    height.set(snapshot.height);
+    palette.set(snapshot.palette);
+    selected_frame.set(snapshot.selected_frame);
 }
 
 fn resize_frames(
@@ -1811,6 +2004,7 @@ fn PixelCell(
     ghost: u8,
     onion: bool,
     mut frames: Signal<Vec<Frame>>,
+    mut history: Signal<History>,
     selected_frame: Signal<usize>,
     selected_color: Signal<usize>,
     palette: Signal<Vec<String>>,
@@ -1822,6 +2016,10 @@ fn PixelCell(
     mut selection_drag: Signal<Option<SelectionDrag>>,
     mut clipboard: Signal<Option<Clipboard>>,
     mut hovered_pixel: Signal<Option<usize>>,
+    width_state: Signal<usize>,
+    height_state: Signal<usize>,
+    frame_time_ms: Signal<u32>,
+    animation_name: Signal<String>,
 ) -> Element {
     let colors = palette.read();
     let is_current = pixel > 0;
@@ -1866,6 +2064,7 @@ fn PixelCell(
                     .is_some_and(|pointer| pointer.button() == 2)
                 {
                     event.prevent_default();
+                    record_document(&mut history, &frames, &width_state, &height_state, &frame_time_ms, &palette, &animation_name, &selected_frame);
                     right_erasing.set(true);
                     frames.with_mut(|all| all[*selected_frame.read()].pixels[index] = 0);
                     return;
@@ -1876,12 +2075,16 @@ fn PixelCell(
                 let current_tool = *tool.read();
                 match current_tool {
                     Tool::Pencil => {
+                        record_document(&mut history, &frames, &width_state, &height_state, &frame_time_ms, &palette, &animation_name, &selected_frame);
                         painting.set(true);
                         let color = *selected_color.read() as u8;
                         frames.with_mut(|all| all[frame].pixels[index] = color);
                     }
                     Tool::Fill => {
                         let color = *selected_color.read() as u8;
+                        if frames.read()[frame].pixels[index] != color {
+                            record_document(&mut history, &frames, &width_state, &height_state, &frame_time_ms, &palette, &animation_name, &selected_frame);
+                        }
                         flood_fill(&mut frames, frame, width, height, index, color);
                         tool.set(Tool::Pencil);
                     }
@@ -1889,6 +2092,7 @@ fn PixelCell(
                         let current_selection = *selection.read();
                         if let Some(region) = current_selection {
                             if x >= region.x && x < region.x + region.width && y >= region.y && y < region.y + region.height {
+                                record_document(&mut history, &frames, &width_state, &height_state, &frame_time_ms, &palette, &animation_name, &selected_frame);
                                 let pixels = copy_region(&frames.read()[frame].pixels, width, region).pixels;
                                 selection_drag.set(Some(SelectionDrag { start_x: x, start_y: y, source: region, pixels }));
                             } else {
@@ -1902,6 +2106,7 @@ fn PixelCell(
                     }
                     Tool::Paste => {
                         if let Some(copy) = clipboard.read().clone() {
+                            record_document(&mut history, &frames, &width_state, &height_state, &frame_time_ms, &palette, &animation_name, &selected_frame);
                             let region = paste_clipboard(&mut frames, frame, width, height, x, y, &copy);
                             selection.set(Some(region));
                             tool.set(Tool::Select);
