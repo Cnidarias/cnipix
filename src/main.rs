@@ -52,6 +52,7 @@ fn App() -> Element {
     let mut selected_color = use_signal(|| 2usize);
     let mut painting = use_signal(|| false);
     let mut playing = use_signal(|| false);
+    let mut preview_open = use_signal(|| false);
     let mut onion_skin = use_signal(|| true);
     let mut zoom = use_signal(|| 1.0f32);
     let mut animation_name = use_signal(|| String::from("CNIPIX_ANIMATION"));
@@ -89,6 +90,7 @@ fn App() -> Element {
     let zoom_level = *zoom.read();
     let is_onion = *onion_skin.read();
     let is_playing = *playing.read();
+    let is_preview_open = *preview_open.read();
     let name = animation_name.read().clone();
     let frame_list = frames.read().clone();
     let current_pixels = frame_list[active].pixels.clone();
@@ -98,6 +100,7 @@ fn App() -> Element {
         PALETTE[selected]
     };
     let frame_position_label = format!("Frame {} of {}", active + 1, frame_list.len());
+    let preview_frame_label = format!("Frame {} of {}", active + 1, frame_list.len());
     let zoom_label = format!("{}%", (zoom_level * 100.0).round() as u32);
     let fps_label = format!("{} fps", (1000.0 / frame_time as f32).round() as u32);
     let previous_frame = if frame_list.len() > 1 {
@@ -107,6 +110,12 @@ fn App() -> Element {
     };
     let previous_pixels = previous_frame.map(|index| frame_list[index].pixels.clone());
     let zoomed_pixel = (24.0 * zoom_level).round().max(6.0);
+    let preview_pixel = (70.0_f32 * 8.0 / w as f32)
+        .min(62.0_f32 * 8.0 / h as f32)
+        .clamp(4.0, 28.0);
+    let preview_grid_style = format!(
+        "grid-template-columns: repeat({w}, {preview_pixel}px); --preview-pixel-size: {preview_pixel}px;"
+    );
     let grid_style = format!(
         "grid-template-columns: repeat({w}, {zoomed_pixel}px); --pixel-size: {zoomed_pixel}px;"
     );
@@ -185,8 +194,17 @@ fn App() -> Element {
                         frames.with_mut(|items| items.insert(at, copy));
                         selected_frame.set(at);
                     }, "Duplicate" }
-                    button { class: if is_playing { "button button-play active" } else { "button button-play" }, onclick: move |_| playing.set(!playing()),
-                        if is_playing { "■  Stop" } else { "▶  Preview" }
+                    button { class: if is_playing { "button button-play active" } else { "button button-play" }, onclick: move |_| {
+                        if is_playing {
+                            playing.set(false);
+                            preview_open.set(false);
+                        } else {
+                            selected_frame.set(0);
+                            preview_open.set(true);
+                            playing.set(true);
+                        }
+                    },
+                        if is_playing { "■  Stop preview" } else { "▶  Preview animation" }
                     }
                 }
                 div { class: "toolbar-divider" }
@@ -273,10 +291,16 @@ fn App() -> Element {
                         div { class: "workspace-tools",
                             span { class: "dimension-badge", "{w} × {h}" }
                             span { class: "workspace-separator" }
-                            span { class: "hint-text", "Scroll to pan · zoom to inspect pixels" }
+                            span { class: "hint-text", "Scroll to zoom · drag scrollbars to pan" }
                         }
                     }
                     div { class: "canvas-viewport",
+                        onwheel: move |event| {
+                            event.prevent_default();
+                            let delta = event.data().delta().strip_units().y;
+                            let factor = (-delta * 0.0015).exp() as f32;
+                            zoom.set((zoom() * factor).clamp(0.25, 8.0));
+                        },
                         div {
                             class: "pixel-grid",
                             style: "{grid_style}",
@@ -325,6 +349,31 @@ fn App() -> Element {
                                     span { key: "thumb-{frame_index}-{pixel_index}", style: if *color_index == 0 { "background: transparent".to_owned() } else { format!("background:{}", PALETTE[*color_index as usize]) } }
                                 }
                             }
+                        }
+                    }
+                }
+            }
+            if is_preview_open {
+                div { class: "preview-overlay",
+                    div { class: "preview-dialog", role: "dialog", aria_label: "Animation preview",
+                        div { class: "preview-header",
+                            div { class: "preview-heading", strong { "Animation preview" } span { "{name}" } }
+                            button { class: "icon-button preview-close", title: "Close preview", onclick: move |_| { preview_open.set(false); playing.set(false); }, "×" }
+                        }
+                        div { class: "preview-stage",
+                            div { class: "preview-grid", style: "{preview_grid_style}",
+                                for (pixel_index, color_index) in current_pixels.iter().enumerate() {
+                                    span {
+                                        key: "preview-pixel-{pixel_index}",
+                                        style: if *color_index == 0 { "background: transparent".to_owned() } else { format!("background:{}", PALETTE[*color_index as usize]) }
+                                    }
+                                }
+                            }
+                        }
+                        div { class: "preview-footer",
+                            span { "{preview_frame_label}" }
+                            span { "{frame_time} ms · {fps_label}" }
+                            button { class: "button button-quiet small-button", onclick: move |_| { preview_open.set(false); playing.set(false); }, "Close preview" }
                         }
                     }
                 }

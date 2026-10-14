@@ -18,9 +18,9 @@ Open the local address printed by `dx serve` in a browser. Dioxus uses WebAssemb
 
 - Draw with click or pointer-drag using the palette. Palette slot zero clears pixels and exports transparent alpha.
 - Set the frame cell width and height independently from 1–64 pixels. Resizing keeps the top-left portion of existing artwork.
-- Set frame timing from 10–2000 ms. Preview loops through the timeline at that speed.
+- Set frame timing from 10–2000 ms. **Preview animation** opens a stage that loops through the timeline at that speed.
 - Onion skin is on by default and shows the previous frame beneath transparent pixels in the selected frame.
-- Use the zoom controls to enlarge the canvas. Scrollbars, wheel, and trackpad scrolling pan around the enlarged region.
+- Use the mouse wheel or zoom controls to enlarge the canvas. Drag the viewport scrollbars to pan around the enlarged region.
 - Add, duplicate, select, and delete frames in the timeline.
 
 ## Game export
