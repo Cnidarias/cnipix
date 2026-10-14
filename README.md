@@ -14,6 +14,18 @@ dx serve
 
 Open the local address printed by `dx serve` in a browser. Dioxus uses WebAssembly for its web renderer; see the [Dioxus Web guide](https://dioxuslabs.com/learn/0.7/guides/platforms/web/) and [getting-started guide](https://dioxuslabs.com/learn/0.7/getting_started/) for setup details.
 
+## Run with Docker
+
+Build the production web app and serve it locally with Docker Compose:
+
+```sh
+docker compose up --build
+```
+
+Open `http://localhost:8080`. Set `CNIPIX_PORT` to change the host port, for example `CNIPIX_PORT=3000 docker compose up --build`. Stop the app with `docker compose down`.
+
+The GitHub Actions workflow builds the image for pull requests and publishes it to GitHub Container Registry on pushes to the default branch and on version tags (`v*`). The image is `ghcr.io/cnidarias/cnipix`; the default branch publishes the `latest` tag. After the first publish, make the package public in its GitHub Packages settings if it is not already public.
+
 ## Editing
 
 - Draw with click or pointer-drag using the palette. Palette slot zero clears pixels and exports transparent alpha.
@@ -33,3 +45,11 @@ Open the local address printed by `dx serve` in a browser. Dioxus uses WebAssemb
 **Export game files** downloads `cnipix_animated_sprite.json` and `cnipix_spritesheet.png` from the browser. Copy both into `corrupted-scythe/assets/player/`. The JSON uses the game's expected `spritesheet`, `width`, `height`, and `anims` fields. `frametime` is expressed in seconds, and the numeric frame indices select cells from the exported horizontal strip.
 
 The exported sprite path is `assets/player/cnipix_spritesheet.png`.
+
+## Load a project
+
+Choose **Load project** and select the matching animation JSON and PNG sprite sheet together. The editor loads the first animation listed in the JSON. Imported colors are matched to the closest cnipix palette color, and transparent pixels remain transparent.
+
+## Palettes
+
+Use **Import** or **Export** beside the palette to load or download a JSON palette. Palette JSON can be an array of hex colors or an object with a `colors` array. The transparent erase slot is kept separately; provide 1–15 opaque colors. Replacing a palette remaps existing artwork to the closest new color.

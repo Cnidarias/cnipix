@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" shape-rendering="crispEdges">
+  <rect width="64" height="64" rx="15" fill="#171923"/>
+  <!-- Soft pixel glow behind the jellyfish -->
+  <path fill="#a88bfa" opacity=".15" d="M18 11h28v4h7v7h4v18h-4v7h-7v7H18v-7h-7v-7H7V22h4v-7h7z"/>
+  <!-- Bell -->
+  <path fill="#9672f2" d="M21 13h22v4h7v7h4v11H10V24h4v-7h7z"/>
+  <path fill="#d0c1ff" d="M21 13h22v4h7v7h-7v4H17v-4h-7v-3h4v-4h7z"/>
+  <path fill="#b7a2ff" d="M17 28h30v4H17z"/>
+  <!-- Face -->
+  <path fill="#242331" d="M22 29h4v4h-4zm14 0h4v4h-4z"/>
+  <path fill="#ff9fba" d="M28 35h8v3h-8z"/>
+  <!-- Wavy tentacles -->
+  <path fill="#88d6b3" d="M16 38h5v9h4v8h-4v-4h-4v-9h-4v-4h3zm14 0h4v7h-4zm-3 7h4v7h-4zm15-7h5v4h-4v9h-4v4h-4v-4h4v-9h3z"/>
+  <path fill="#c1a8ff" d="M28 42h4v5h-4zm12 3h4v5h-4z"/>
+  <!-- Tiny bubbles -->
+  <path fill="#88d6b3" d="M12 12h4v4h-4zm39 4h4v4h-4zM8 20h3v3H8z"/>
+</svg>

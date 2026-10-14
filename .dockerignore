@@ -1,0 +1,10 @@
+.git
+.github
+.agents
+.aws
+.codex
+target
+dist
+.env
+.env.*
+!.env.example

@@ -1,0 +1,9 @@
+services:
+  cnipix:
+    image: ghcr.io/cnidarias/cnipix:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${CNIPIX_PORT:-8080}:80"
+    restart: unless-stopped

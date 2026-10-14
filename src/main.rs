@@ -1,17 +1,19 @@
 use dioxus::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
+use std::io::Cursor;
 
 const INITIAL_WIDTH: usize = 24;
 const INITIAL_HEIGHT: usize = 24;
 const CELL_LIMIT: usize = 64;
 const INITIAL_FRAME_TIME_MS: u32 = 120;
 const SPRITESHEET_PATH: &str = "assets/player/cnipix_spritesheet.png";
-const PALETTE: [&str; 16] = [
+const DEFAULT_PALETTE: [&str; 16] = [
     "#171923", "#f7f3e8", "#ef476f", "#ff9f1c", "#ffd166", "#06d6a0", "#118ab2", "#4361ee",
     "#8338ec", "#ff70a6", "#8d6e63", "#b7c4cf", "#59656f", "#7cb518", "#c1121f", "#ffffff",
 ];
 const MAIN_CSS: Asset = asset!("/assets/main.css");
+const FAVICON: Asset = asset!("/assets/favicon.svg");
 
 #[derive(Clone, PartialEq)]
 struct Frame {
@@ -58,11 +60,41 @@ struct AnimationExport {
     anims: Vec<AnimationDefinition>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct AnimationDefinition {
     name: String,
     frametime: f32,
     frames: Vec<usize>,
+}
+
+#[derive(Deserialize)]
+struct ProjectManifest {
+    spritesheet: String,
+    width: usize,
+    height: usize,
+    anims: Vec<AnimationDefinition>,
+}
+
+struct LoadedProject {
+    width: usize,
+    height: usize,
+    name: String,
+    frame_time_ms: u32,
+    frames: Vec<Frame>,
+    animation_count: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PaletteFile {
+    name: Option<String>,
+    colors: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PaletteDocument {
+    Named(PaletteFile),
+    Colors(Vec<String>),
 }
 
 fn main() {
@@ -81,6 +113,12 @@ fn App() -> Element {
     let mut frame_time_ms = use_signal(|| INITIAL_FRAME_TIME_MS);
     let mut selected_frame = use_signal(|| 0usize);
     let mut selected_color = use_signal(|| 2usize);
+    let mut palette = use_signal(|| {
+        DEFAULT_PALETTE
+            .iter()
+            .map(|color| (*color).to_owned())
+            .collect::<Vec<_>>()
+    });
     let mut right_erasing = use_signal(|| false);
     let mut tool = use_signal(|| Tool::Pencil);
     let mut selection = use_signal(|| None::<Selection>);
@@ -94,6 +132,7 @@ fn App() -> Element {
     let mut onion_skin = use_signal(|| true);
     let mut zoom = use_signal(|| 1.0f32);
     let mut animation_name = use_signal(|| String::from("CNIPIX_ANIMATION"));
+    let mut project_label = use_signal(|| String::from("Untitled sprite"));
     let mut status = use_signal(|| String::from("Ready · choose a color and draw"));
 
     let play_state = playing;
@@ -125,6 +164,7 @@ fn App() -> Element {
     let frame_time = *frame_time_ms.read();
     let active = (*selected_frame.read()).min(frames.read().len().saturating_sub(1));
     let selected = *selected_color.read();
+    let current_palette = palette.read().clone();
     let active_tool = *tool.read();
     let selected_region = *selection.read();
     let clipboard_available = clipboard.read().is_some();
@@ -138,7 +178,7 @@ fn App() -> Element {
     let selected_color_label = if selected == 0 {
         "Transparent / erase"
     } else {
-        PALETTE[selected]
+        current_palette[selected].as_str()
     };
     let frame_position_label = format!("Frame {} of {}", active + 1, frame_list.len());
     let preview_frame_label = format!("Frame {} of {}", active + 1, frame_list.len());
@@ -163,6 +203,7 @@ fn App() -> Element {
 
     rsx! {
         document::Title { "cnipix · pixel animation studio" }
+        document::Link { rel: "icon", href: FAVICON, r#type: "image/svg+xml" }
         document::Link { rel: "stylesheet", href: MAIN_CSS }
         main {
             class: "app-shell",
@@ -228,7 +269,9 @@ fn App() -> Element {
                         _ => None,
                     };
                     if let Some(color) = shifted_color {
-                        selected_color.set(color);
+                        if color < palette.read().len() {
+                            selected_color.set(color);
+                        }
                         return;
                     }
                 }
@@ -264,7 +307,9 @@ fn App() -> Element {
                     _ => {
                         if key.len() == 1 {
                             if let Ok(color) = key.parse::<usize>() {
-                                if color <= 9 { selected_color.set(color); }
+                                if color <= 9 && color < palette.read().len() {
+                                    selected_color.set(color);
+                                }
                             }
                         }
                     }
@@ -284,7 +329,7 @@ fn App() -> Element {
             header {
                 class: "topbar",
                 div { class: "brand-lockup",
-                    div { class: "brand-mark", "c" }
+                    img { class: "brand-mark", src: FAVICON, alt: "cnipix jellyfish" }
                     div { class: "brand-copy",
                         strong { "cnipix" }
                         span { "pixel animation studio" }
@@ -292,10 +337,53 @@ fn App() -> Element {
                 }
                 div { class: "topbar-project",
                     span { class: "live-dot" }
-                    span { "Untitled sprite" }
+                    span { "{project_label}" }
                     span { class: "project-size", "{w} × {h}" }
                 }
                 div { class: "topbar-actions",
+                    label { class: "button button-quiet load-project-button",
+                        span { "↑ Load project" }
+                        input {
+                            class: "project-file-input",
+                            r#type: "file",
+                            accept: ".json,.png",
+                            multiple: true,
+                            onchange: move |event| {
+                                let files = event.files();
+                                if files.is_empty() { return; }
+                                status.set("Loading project files…".to_owned());
+                                let import_palette = palette.read().clone();
+                                spawn(async move {
+                                    match load_project_files(files, import_palette).await {
+                                        Ok(project) => {
+                                            let loaded_message = if project.animation_count > 1 {
+                                                format!("Loaded {} · first of {} animations", project.name, project.animation_count)
+                                            } else {
+                                                format!("Loaded {}", project.name)
+                                            };
+                                            width.set(project.width);
+                                            height.set(project.height);
+                                            frame_time_ms.set(project.frame_time_ms);
+                                            project_label.set(project.name.clone());
+                                            animation_name.set(project.name);
+                                            frames.set(project.frames);
+                                            selected_frame.set(0);
+                                            playing.set(false);
+                                            preview_open.set(false);
+                                            zoom.set(1.0);
+                                            selection.set(None);
+                                            selection_anchor.set(None);
+                                            selection_drag.set(None);
+                                            clipboard.set(None);
+                                            tool.set(Tool::Pencil);
+                                            status.set(loaded_message);
+                                        }
+                                        Err(error) => status.set(format!("Project load failed: {error}")),
+                                    }
+                                });
+                            }
+                        }
+                    }
                     label { class: "name-label", "ANIMATION" }
                     input {
                         class: "name-input",
@@ -317,7 +405,7 @@ fn App() -> Element {
                                 }],
                             };
                             let json = serde_json::to_string_pretty(&export);
-                            let png = encode_spritesheet(&frames.read(), *width.read(), *height.read());
+                            let png = encode_spritesheet(&frames.read(), *width.read(), *height.read(), &palette.read());
                             match (json, png) {
                                 (Ok(json), Ok(png)) => {
                                     let json_result = download_file("cnipix_animated_sprite.json", "application/json", json.as_bytes());
@@ -400,9 +488,52 @@ fn App() -> Element {
             section { class: "editor-layout",
                 aside { class: "sidebar",
                     section { class: "side-section palette-section",
-                        div { class: "section-heading", span { "Palette" } span { class: "section-hint", "0 erase · 1–9 / ⇧1–6" } }
+                        div { class: "section-heading", span { "Palette" } span { class: "section-hint", "{current_palette.len() - 1} colors" } }
+                        div { class: "palette-actions",
+                                label { class: "palette-action", title: "Import palette JSON",
+                                    "↑ Import"
+                                    input {
+                                        class: "palette-upload-input",
+                                        r#type: "file",
+                                        accept: ".json,application/json",
+                                        onchange: move |event| {
+                                            let Some(file) = event.files().into_iter().next() else { return; };
+                                            status.set("Loading palette…".to_owned());
+                                            spawn(async move {
+                                                match file.read_string().await {
+                                                    Ok(contents) => match parse_palette_file(&contents) {
+                                                        Ok(new_palette) => {
+                                                            let old_palette = palette.read().clone();
+                                                            frames.with_mut(|all| remap_frames_palette(all, &old_palette, &new_palette));
+                                                            let next_selected = (*selected_color.read()).min(new_palette.len() - 1);
+                                                            selected_color.set(next_selected);
+                                                            palette.set(new_palette);
+                                                            status.set("Palette loaded · artwork remapped to the new colors".to_owned());
+                                                        }
+                                                        Err(error) => status.set(format!("Palette load failed: {error}")),
+                                                    },
+                                                    Err(error) => status.set(format!("Could not read palette file: {error:?}")),
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                                button { class: "palette-action", title: "Download palette JSON", onclick: move |_| {
+                                    let palette_file = PaletteFile {
+                                        name: Some("cnipix palette".to_owned()),
+                                        colors: palette.read().iter().skip(1).cloned().collect(),
+                                    };
+                                    match serde_json::to_string_pretty(&palette_file) {
+                                        Ok(json) => match download_file("cnipix_palette.json", "application/json", json.as_bytes()) {
+                                            Ok(()) => status.set("Palette downloaded".to_owned()),
+                                            Err(error) => status.set(format!("Palette download failed: {error}")),
+                                        },
+                                        Err(error) => status.set(format!("Could not create palette JSON: {error}")),
+                                    }
+                                }, "↓ Export" }
+                        }
                         div { class: "palette-grid",
-                            for (index, color) in PALETTE.iter().enumerate() {
+                            for (index, color) in current_palette.iter().enumerate() {
                                 button {
                                     key: "swatch-{index}",
                                     class: if index == selected { "swatch selected" } else { "swatch" },
@@ -414,7 +545,7 @@ fn App() -> Element {
                             }
                         }
                         div { class: "selected-color-info",
-                            span { class: "color-chip", style: if selected == 0 { "background: repeating-conic-gradient(#3d4351 0% 25%, #242832 0% 50%) 50% / 10px 10px".to_owned() } else { format!("background:{}", PALETTE[selected]) } }
+                            span { class: "color-chip", style: if selected == 0 { "background: repeating-conic-gradient(#3d4351 0% 25%, #242832 0% 50%) 50% / 10px 10px".to_owned() } else { format!("background:{}", current_palette[selected]) } }
                             span { "{selected_color_label}" }
                         }
                     }
@@ -502,6 +633,7 @@ fn App() -> Element {
                                     frames,
                                     selected_frame,
                                     selected_color,
+                                    palette,
                                     painting,
                                     right_erasing,
                                     tool,
@@ -540,7 +672,7 @@ fn App() -> Element {
                             div { class: "frame-card-top", FrameNumber { number: frame_index + 1 } span { class: "frame-duration", "{frame_time}ms" } }
                             div { class: "frame-thumb", style: format!("grid-template-columns: repeat({}, minmax(0, 1fr)); grid-template-rows: repeat({}, minmax(0, 1fr))", *width.read(), *height.read()),
                                 for (pixel_index, color_index) in frame.pixels.iter().enumerate() {
-                                    span { key: "thumb-{frame_index}-{pixel_index}", style: if *color_index == 0 { "background: transparent".to_owned() } else { format!("background:{}", PALETTE[*color_index as usize]) } }
+                                    span { key: "thumb-{frame_index}-{pixel_index}", style: if *color_index == 0 { "background: transparent".to_owned() } else { format!("background:{}", current_palette[*color_index as usize]) } }
                                 }
                             }
                         }
@@ -559,7 +691,7 @@ fn App() -> Element {
                                 for (pixel_index, color_index) in current_pixels.iter().enumerate() {
                                     span {
                                         key: "preview-pixel-{pixel_index}",
-                                        style: if *color_index == 0 { "background: transparent".to_owned() } else { format!("background:{}", PALETTE[*color_index as usize]) }
+                                        style: if *color_index == 0 { "background: transparent".to_owned() } else { format!("background:{}", current_palette[*color_index as usize]) }
                                     }
                                 }
                             }
@@ -605,6 +737,226 @@ fn resize_frames(
             frame.pixels = resized;
         }
     });
+}
+
+async fn load_project_files(
+    files: Vec<dioxus::html::FileData>,
+    palette: Vec<String>,
+) -> Result<LoadedProject, String> {
+    let mut manifest_file: Option<(String, String)> = None;
+    let mut spritesheets = Vec::new();
+    for file in files {
+        let name = file.name();
+        match name
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "json" => {
+                let contents = file
+                    .read_string()
+                    .await
+                    .map_err(|error| format!("could not read {name}: {error:?}"))?;
+                manifest_file = Some((name, contents));
+            }
+            "png" => {
+                let contents = file
+                    .read_bytes()
+                    .await
+                    .map_err(|error| format!("could not read {name}: {error:?}"))?;
+                spritesheets.push((name, contents.to_vec()));
+            }
+            _ => {}
+        }
+    }
+    let (_, manifest_text) = manifest_file.ok_or("select the animation JSON file too")?;
+    let manifest: ProjectManifest = serde_json::from_str(&manifest_text)
+        .map_err(|error| format!("invalid animation JSON: {error}"))?;
+    let expected_sheet = manifest
+        .spritesheet
+        .rsplit(|character| character == '/' || character == '\\')
+        .next()
+        .unwrap_or(&manifest.spritesheet);
+    let (_, sheet_bytes) = spritesheets
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(expected_sheet))
+        .ok_or_else(|| format!("select the PNG named {expected_sheet}"))?;
+    load_project(&manifest, &sheet_bytes, &palette)
+}
+
+fn load_project(
+    manifest: &ProjectManifest,
+    png_bytes: &[u8],
+    palette: &[String],
+) -> Result<LoadedProject, String> {
+    if manifest.width == 0
+        || manifest.height == 0
+        || manifest.width > CELL_LIMIT
+        || manifest.height > CELL_LIMIT
+    {
+        return Err(format!(
+            "cell dimensions must be between 1 and {CELL_LIMIT} pixels"
+        ));
+    }
+    let animation = manifest
+        .anims
+        .first()
+        .ok_or("the JSON file does not contain any animations")?;
+    if animation.frames.is_empty() {
+        return Err("the first animation does not contain any frames".to_owned());
+    }
+
+    let mut decoder = png::Decoder::new(Cursor::new(png_bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| format!("could not decode sprite sheet: {error}"))?;
+    let mut buffer = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buffer)
+        .map_err(|error| format!("could not read sprite sheet pixels: {error}"))?;
+    let sheet_width = info.width as usize;
+    let sheet_height = info.height as usize;
+    if sheet_width == 0
+        || sheet_height == 0
+        || sheet_width
+            .checked_mul(sheet_height)
+            .is_none_or(|area| area > 16_777_216)
+    {
+        return Err("sprite sheet dimensions are empty or too large".to_owned());
+    }
+    if sheet_width % manifest.width != 0 || sheet_height % manifest.height != 0 {
+        return Err("sprite sheet dimensions are not a multiple of the JSON cell size".to_owned());
+    }
+    let pixels = png_to_rgba(&buffer[..info.buffer_size()], info.color_type)?;
+    let columns = sheet_width / manifest.width;
+    let rows = sheet_height / manifest.height;
+    let cell_count = columns * rows;
+    let mut frames = Vec::with_capacity(animation.frames.len());
+    for &frame_index in &animation.frames {
+        if frame_index >= cell_count {
+            return Err(format!(
+                "animation references frame {frame_index}, but the sprite sheet has only {cell_count} cells"
+            ));
+        }
+        let origin_x = (frame_index % columns) * manifest.width;
+        let origin_y = (frame_index / columns) * manifest.height;
+        let mut frame_pixels = Vec::with_capacity(manifest.width * manifest.height);
+        for y in 0..manifest.height {
+            for x in 0..manifest.width {
+                let offset = ((origin_y + y) * sheet_width + origin_x + x) * 4;
+                let rgba = &pixels[offset..offset + 4];
+                frame_pixels.push(if rgba[3] < 128 {
+                    0
+                } else {
+                    nearest_palette_color(rgba[0], rgba[1], rgba[2], palette)
+                });
+            }
+        }
+        frames.push(Frame {
+            pixels: frame_pixels,
+        });
+    }
+    let frame_time_ms = (animation.frametime.clamp(0.01, 2.0) * 1000.0).round() as u32;
+    Ok(LoadedProject {
+        width: manifest.width,
+        height: manifest.height,
+        name: animation.name.clone(),
+        frame_time_ms,
+        frames,
+        animation_count: manifest.anims.len(),
+    })
+}
+
+fn png_to_rgba(data: &[u8], color_type: png::ColorType) -> Result<Vec<u8>, String> {
+    let mut rgba = Vec::new();
+    match color_type {
+        png::ColorType::Rgba => Ok(data.to_vec()),
+        png::ColorType::Rgb => {
+            rgba.reserve(data.len() / 3 * 4);
+            for pixel in data.chunks_exact(3) {
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+            }
+            Ok(rgba)
+        }
+        png::ColorType::Grayscale => {
+            rgba.reserve(data.len() * 4);
+            for &gray in data {
+                rgba.extend_from_slice(&[gray, gray, gray, 255]);
+            }
+            Ok(rgba)
+        }
+        png::ColorType::GrayscaleAlpha => {
+            rgba.reserve(data.len() * 2);
+            for pixel in data.chunks_exact(2) {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+            Ok(rgba)
+        }
+        png::ColorType::Indexed => Err("could not expand indexed sprite sheet colors".to_owned()),
+    }
+}
+
+fn nearest_palette_color(red: u8, green: u8, blue: u8, palette: &[String]) -> u8 {
+    let mut nearest = (u32::MAX, 1u8);
+    for (index, color) in palette.iter().enumerate().skip(1) {
+        let rgb = u32::from_str_radix(color.trim_start_matches('#'), 16).unwrap_or(0);
+        let dr = red as i32 - ((rgb >> 16) & 0xff) as i32;
+        let dg = green as i32 - ((rgb >> 8) & 0xff) as i32;
+        let db = blue as i32 - (rgb & 0xff) as i32;
+        let distance = (dr * dr + dg * dg + db * db) as u32;
+        if distance < nearest.0 {
+            nearest = (distance, index as u8);
+        }
+    }
+    nearest.1
+}
+
+fn parse_palette_file(contents: &str) -> Result<Vec<String>, String> {
+    let document: PaletteDocument =
+        serde_json::from_str(contents).map_err(|error| format!("invalid palette JSON: {error}"))?;
+    let entries = match document {
+        PaletteDocument::Named(file) => file.colors,
+        PaletteDocument::Colors(colors) => colors,
+    };
+    if entries.is_empty() || entries.len() > 15 {
+        return Err("a palette must contain between 1 and 15 colors".to_owned());
+    }
+    let mut palette = vec!["#171923".to_owned()];
+    for color in entries {
+        let hex = color.trim().trim_start_matches('#');
+        if hex.len() != 6 || !hex.chars().all(|character| character.is_ascii_hexdigit()) {
+            return Err(format!("{color:?} is not a six digit hex color"));
+        }
+        palette.push(format!("#{hex}").to_ascii_lowercase());
+    }
+    Ok(palette)
+}
+
+fn remap_frames_palette(frames: &mut [Frame], old_palette: &[String], new_palette: &[String]) {
+    for frame in frames {
+        for color_index in &mut frame.pixels {
+            if *color_index == 0 {
+                continue;
+            }
+            let Some(color) = old_palette.get(*color_index as usize) else {
+                *color_index = 0;
+                continue;
+            };
+            let Ok(rgb) = u32::from_str_radix(color.trim_start_matches('#'), 16) else {
+                *color_index = 0;
+                continue;
+            };
+            *color_index = nearest_palette_color(
+                ((rgb >> 16) & 0xff) as u8,
+                ((rgb >> 8) & 0xff) as u8,
+                (rgb & 0xff) as u8,
+                new_palette,
+            );
+        }
+    }
 }
 
 fn selection_from_points(x1: usize, y1: usize, x2: usize, y2: usize) -> Selection {
@@ -741,6 +1093,7 @@ fn PixelCell(
     mut frames: Signal<Vec<Frame>>,
     selected_frame: Signal<usize>,
     selected_color: Signal<usize>,
+    palette: Signal<Vec<String>>,
     mut painting: Signal<bool>,
     mut right_erasing: Signal<bool>,
     mut tool: Signal<Tool>,
@@ -750,12 +1103,13 @@ fn PixelCell(
     mut clipboard: Signal<Option<Clipboard>>,
     mut hovered_pixel: Signal<Option<usize>>,
 ) -> Element {
+    let colors = palette.read();
     let is_current = pixel > 0;
     let show_ghost = onion && !is_current && ghost > 0;
     let background = if is_current {
-        PALETTE[pixel as usize].to_owned()
+        colors[pixel as usize].to_owned()
     } else if show_ghost {
-        ghost_color(PALETTE[ghost as usize])
+        ghost_color(&colors[ghost as usize])
     } else {
         "transparent".to_owned()
     };
@@ -874,7 +1228,12 @@ fn ghost_color(hex: &str) -> String {
     format!("rgba({r}, {g}, {b}, 0.42)")
 }
 
-fn encode_spritesheet(frames: &[Frame], width: usize, height: usize) -> Result<Vec<u8>, String> {
+fn encode_spritesheet(
+    frames: &[Frame],
+    width: usize,
+    height: usize,
+    palette: &[String],
+) -> Result<Vec<u8>, String> {
     let sheet_width = width
         .checked_mul(frames.len())
         .ok_or("sprite sheet is too large")?;
@@ -885,7 +1244,7 @@ fn encode_spritesheet(frames: &[Frame], width: usize, height: usize) -> Result<V
                 let color_index = frame.pixels[y * width + x] as usize;
                 let offset = (y * sheet_width + frame_index * width + x) * 4;
                 if color_index > 0 {
-                    let hex = u32::from_str_radix(PALETTE[color_index].trim_start_matches('#'), 16)
+                    let hex = u32::from_str_radix(palette[color_index].trim_start_matches('#'), 16)
                         .unwrap_or(0);
                     rgba[offset] = ((hex >> 16) & 0xff) as u8;
                     rgba[offset + 1] = ((hex >> 8) & 0xff) as u8;
