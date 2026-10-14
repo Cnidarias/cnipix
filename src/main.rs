@@ -16,7 +16,7 @@ const DEFAULT_PALETTE: [&str; 16] = [
 const MAIN_CSS: Asset = asset!("/assets/main.css");
 const FAVICON: Asset = asset!("/assets/favicon.svg");
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct Frame {
     /// Row-major palette indices. Index zero is transparent.
     pixels: Vec<u8>,
@@ -45,6 +45,13 @@ enum Tool {
     Select,
     Fill,
     Paste,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SaveState {
+    Unsaved,
+    BrowserSaved,
+    FileSaved,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -103,6 +110,22 @@ struct LoadedProject {
     palette: Vec<String>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct AutosaveProject {
+    version: u8,
+    width: usize,
+    height: usize,
+    frame_time_ms: u32,
+    frames: Vec<Frame>,
+    palette: Vec<String>,
+    animation_name: String,
+    project_label: String,
+    #[serde(default)]
+    mapped_json_path: Option<String>,
+    #[serde(default)]
+    mapped_animation_index: Option<usize>,
+}
+
 #[derive(Clone, PartialEq, Deserialize)]
 struct MappedProject {
     id: u32,
@@ -115,6 +138,12 @@ struct MappedAnimation {
     name: String,
     index: usize,
     preview: String,
+}
+
+enum DirectoryRestore {
+    NoSavedFolder,
+    PermissionRequired,
+    Mapped(Vec<MappedProject>),
 }
 
 #[derive(Clone, PartialEq)]
@@ -132,10 +161,124 @@ struct ActiveMapping {
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
 let cnipixRoot = null;
 let cnipixFiles = [];
+let cnipixCanvasPan = null;
+let cnipixCanvasPanOffset = { x: 0, y: 0 };
+let cnipixCanvasPanInstalled = false;
+
+export function cnipixInstallCanvasPan() {
+  if (cnipixCanvasPanInstalled) return;
+  cnipixCanvasPanInstalled = true;
+  document.addEventListener('pointerdown', event => {
+    if (!event.shiftKey || event.button !== 0 || !(event.target instanceof Element)) return;
+    const viewport = event.target.closest('.canvas-viewport');
+    if (!viewport) return;
+    const canvas = viewport.querySelector('.pixel-grid');
+    if (!canvas) return;
+    event.preventDefault();
+    event.stopPropagation();
+    viewport.setPointerCapture(event.pointerId);
+    viewport.classList.add('panning');
+    cnipixCanvasPan = {
+      viewport,
+      canvas,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      offsetX: cnipixCanvasPanOffset.x,
+      offsetY: cnipixCanvasPanOffset.y,
+    };
+  }, true);
+  document.addEventListener('pointermove', event => {
+    const pan = cnipixCanvasPan;
+    if (!pan || event.pointerId !== pan.pointerId) return;
+    event.preventDefault();
+    cnipixCanvasPanOffset = {
+      x: pan.offsetX + event.clientX - pan.startX,
+      y: pan.offsetY + event.clientY - pan.startY,
+    };
+    pan.viewport.style.setProperty('--canvas-pan-x', `${cnipixCanvasPanOffset.x}px`);
+    pan.viewport.style.setProperty('--canvas-pan-y', `${cnipixCanvasPanOffset.y}px`);
+  }, true);
+  const stopPan = event => {
+    if (!cnipixCanvasPan || event.pointerId !== cnipixCanvasPan.pointerId) return;
+    cnipixCanvasPan.viewport.classList.remove('panning');
+    cnipixCanvasPan = null;
+  };
+  document.addEventListener('pointerup', stopPan, true);
+  document.addEventListener('pointercancel', stopPan, true);
+}
+
+function cnipixHandleDatabase() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('cnipix-browser-state', 1);
+    request.onupgradeneeded = () => request.result.createObjectStore('handles');
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function cnipixStoreDirectoryHandle(handle) {
+  const db = await cnipixHandleDatabase();
+  await new Promise((resolve, reject) => {
+    const request = db.transaction('handles', 'readwrite').objectStore('handles').put(handle, 'project-root');
+    request.onsuccess = resolve;
+    request.onerror = () => reject(request.error);
+  });
+  db.close();
+}
+
+async function cnipixGetDirectoryHandle() {
+  const db = await cnipixHandleDatabase();
+  const handle = await new Promise((resolve, reject) => {
+    const request = db.transaction('handles', 'readonly').objectStore('handles').get('project-root');
+    request.onsuccess = () => resolve(request.result || null);
+    request.onerror = () => reject(request.error);
+  });
+  db.close();
+  return handle;
+}
+
+export function cnipixReadAutosave() {
+  try { return localStorage.getItem('cnipix.autosave.v1'); }
+  catch { return null; }
+}
+
+export function cnipixWriteAutosave(content) {
+  try { localStorage.setItem('cnipix.autosave.v1', content); return true; }
+  catch (error) { console.warn('cnipix could not autosave this project', error); return false; }
+}
+
+export function cnipixClearAutosave() {
+  try { localStorage.removeItem('cnipix.autosave.v1'); }
+  catch { /* storage may be unavailable in private browsing */ }
+}
 
 export async function cnipixMapDirectory() {
   if (!window.showDirectoryPicker) throw new Error('Folder mapping requires a Chromium browser with File System Access support.');
   cnipixRoot = await window.showDirectoryPicker({ mode: 'readwrite' });
+  try { await cnipixStoreDirectoryHandle(cnipixRoot); }
+  catch (error) { console.warn('cnipix could not remember the selected folder', error); }
+  return cnipixScanDirectory(cnipixRoot);
+}
+
+export async function cnipixRestoreDirectory() {
+  const root = await cnipixGetDirectoryHandle();
+  if (!root) return '';
+  cnipixRoot = root;
+  if (await root.queryPermission({ mode: 'readwrite' }) !== 'granted') return '__CNIPIX_PERMISSION_REQUIRED__';
+  return cnipixScanDirectory(root);
+}
+
+export async function cnipixReconnectDirectory() {
+  const root = cnipixRoot || await cnipixGetDirectoryHandle();
+  if (!root) return '';
+  const permission = root.requestPermission({ mode: 'readwrite' });
+  if (await permission !== 'granted') return '__CNIPIX_PERMISSION_REQUIRED__';
+  return cnipixScanDirectory(root);
+}
+
+async function cnipixScanDirectory(root) {
+  cnipixRoot = root;
   cnipixFiles = [];
   const entries = [];
   async function walk(directory, prefix = '') {
@@ -223,6 +366,18 @@ export async function cnipixWriteProject(id, manifest, png) {
 }
 "#)]
 extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen]
+    fn cnipixInstallCanvasPan();
+    #[wasm_bindgen::prelude::wasm_bindgen(catch)]
+    fn cnipixRestoreDirectory() -> Result<js_sys::Promise, wasm_bindgen::JsValue>;
+    #[wasm_bindgen::prelude::wasm_bindgen(catch)]
+    fn cnipixReconnectDirectory() -> Result<js_sys::Promise, wasm_bindgen::JsValue>;
+    #[wasm_bindgen::prelude::wasm_bindgen]
+    fn cnipixReadAutosave() -> Option<String>;
+    #[wasm_bindgen::prelude::wasm_bindgen]
+    fn cnipixWriteAutosave(content: &str) -> bool;
+    #[wasm_bindgen::prelude::wasm_bindgen]
+    fn cnipixClearAutosave();
     #[wasm_bindgen::prelude::wasm_bindgen(catch)]
     fn cnipixMapDirectory() -> Result<js_sys::Promise, wasm_bindgen::JsValue>;
     #[wasm_bindgen::prelude::wasm_bindgen(catch)]
@@ -293,8 +448,131 @@ fn App() -> Element {
     let mut directory_projects = use_signal(Vec::<MappedProject>::new);
     let mut directory_mapped = use_signal(|| false);
     let mut directory_browser_open = use_signal(|| false);
+    let mut directory_permission_needed = use_signal(|| false);
     let mut active_mapping = use_signal(|| None::<ActiveMapping>);
+    let mut mapping_target = use_signal(|| None::<(String, usize)>);
     let mut status = use_signal(|| String::from("Ready · choose a color and draw"));
+    let mut autosave_ready = use_signal(|| false);
+    let mut save_state = use_signal(|| SaveState::Unsaved);
+    let mut autosave_revision = use_signal(|| 0u64);
+
+    cnipixInstallCanvasPan();
+
+    use_future(move || async move {
+        match cnipixReadAutosave() {
+            Some(contents) => match serde_json::from_str::<AutosaveProject>(&contents) {
+                Ok(draft) if validate_autosave(&draft).is_ok() => {
+                    width.set(draft.width);
+                    height.set(draft.height);
+                    frame_time_ms.set(draft.frame_time_ms.clamp(10, 2000));
+                    frames.set(draft.frames);
+                    palette.set(draft.palette);
+                    animation_name.set(draft.animation_name);
+                    project_label.set(draft.project_label);
+                    selected_frame.set(0);
+                    mapping_target.set(draft.mapped_json_path.zip(draft.mapped_animation_index));
+                    status.set("Restored autosaved project".to_owned());
+                }
+                Ok(_) | Err(_) => {
+                    cnipixClearAutosave();
+                    status.set("Ignored an invalid autosave draft".to_owned());
+                }
+            },
+            None => {}
+        }
+        autosave_ready.set(true);
+        if let Ok(promise) = cnipixRestoreDirectory() {
+            match restore_project_directory(promise).await {
+                Ok(DirectoryRestore::NoSavedFolder) => {}
+                Ok(DirectoryRestore::PermissionRequired) => {
+                    directory_permission_needed.set(true);
+                    status.set(
+                        "Saved folder needs permission · open Project folder to reconnect"
+                            .to_owned(),
+                    );
+                }
+                Ok(DirectoryRestore::Mapped(projects)) => {
+                    if let Ok(Some(mapping)) = reopen_saved_mapping(
+                        &projects,
+                        mapping_target.read().clone(),
+                        palette.read().clone(),
+                    )
+                    .await
+                    {
+                        active_mapping.set(Some(mapping));
+                    }
+                    let count = projects
+                        .iter()
+                        .map(|project| project.animations.len())
+                        .sum::<usize>();
+                    directory_projects.set(projects);
+                    directory_mapped.set(true);
+                    status.set(format!("Restored mapped folder · {count} animations ready"));
+                }
+                Err(error) => status.set(format!("Could not restore saved folder: {error}")),
+            }
+        }
+    });
+
+    use_effect(move || {
+        if !*autosave_ready.read() {
+            return;
+        }
+        autosave_revision.with_mut(|current| *current += 1);
+        if *save_state.peek() != SaveState::Unsaved {
+            save_state.set(SaveState::Unsaved);
+        }
+    });
+
+    let autosave_revision_state = autosave_revision;
+    let autosave_ready_state = autosave_ready;
+    let mut autosave_save_state = save_state;
+    use_future(move || async move {
+        let mut observed_revision = 0u64;
+        let mut saved_revision = 0u64;
+        let mut idle_ms = 0u32;
+        loop {
+            gloo_timers::future::TimeoutFuture::new(100).await;
+            if !*autosave_ready_state.read() {
+                continue;
+            }
+            let revision = *autosave_revision_state.read();
+            if revision != observed_revision {
+                observed_revision = revision;
+                idle_ms = 0;
+                continue;
+            }
+            if revision == 0 || revision == saved_revision {
+                continue;
+            }
+            idle_ms += 100;
+            if idle_ms < 500 {
+                continue;
+            }
+
+            let draft = AutosaveProject {
+                version: 1,
+                width: *width.read(),
+                height: *height.read(),
+                frame_time_ms: *frame_time_ms.read(),
+                frames: frames.read().clone(),
+                palette: palette.read().clone(),
+                animation_name: animation_name.read().clone(),
+                project_label: project_label.read().clone(),
+                mapped_json_path: mapping_target.read().as_ref().map(|(path, _)| path.clone()),
+                mapped_animation_index: mapping_target.read().as_ref().map(|(_, index)| *index),
+            };
+            if let Ok(contents) = serde_json::to_string(&draft) {
+                if cnipixWriteAutosave(&contents)
+                    && *autosave_save_state.peek() == SaveState::Unsaved
+                {
+                    autosave_save_state.set(SaveState::BrowserSaved);
+                }
+            }
+            saved_revision = revision;
+            idle_ms = 0;
+        }
+    });
 
     let play_state = playing;
     let delay_state = frame_time_ms;
@@ -345,6 +623,11 @@ fn App() -> Element {
     let active_mapping_value = active_mapping.read().clone();
     let mapped_project_active = active_mapping.read().is_some();
     let name = animation_name.read().clone();
+    let (save_indicator_class, save_indicator_label) = match *save_state.read() {
+        SaveState::Unsaved => ("live-dot save-unsaved", "Unsaved changes"),
+        SaveState::BrowserSaved => ("live-dot save-browser", "Saved in this browser"),
+        SaveState::FileSaved => ("live-dot save-file", "Saved to project or exported"),
+    };
     let frame_list = frames.read().clone();
     let current_pixels = frame_list[active].pixels.clone();
     let selected_color_label = if selected == 0 {
@@ -528,7 +811,7 @@ fn App() -> Element {
                     }
                 }
                 div { class: "topbar-project",
-                    span { class: "live-dot" }
+                    span { class: "{save_indicator_class}", title: "{save_indicator_label}", aria_label: "{save_indicator_label}" }
                     span { "{project_label}" }
                     span { class: "project-size", "{w} × {h}" }
                 }
@@ -568,6 +851,7 @@ fn App() -> Element {
                                             frames.set(project.frames);
                                             history.set(History::default());
                                             active_mapping.set(None);
+                                            mapping_target.set(None);
                                             selected_frame.set(0);
                                             playing.set(false);
                                             preview_open.set(false);
@@ -601,6 +885,7 @@ fn App() -> Element {
                             let current_timing = *frame_time_ms.read();
                             let current_name = animation_name.read().clone();
                             let current_palette = palette.read().clone();
+                            let saved_revision = *autosave_revision.read();
                             match prepare_mapped_save(&mapping, &current_frames, current_width, current_height, current_timing, &current_name, &current_palette) {
                                 Ok((manifest, png)) => {
                                     status.set("Saving changes to the mapped JSON and sprite sheet…".to_owned());
@@ -609,6 +894,9 @@ fn App() -> Element {
                                             Ok(()) => {
                                                 let saved_frame_indices = mapped_frame_indices(&manifest, mapping.animation_index);
                                                 active_mapping.with_mut(|active| if let Some(active) = active { active.manifest = manifest; active.png = png; active.original_frame_indices = saved_frame_indices; });
+                                                if *autosave_revision.read() == saved_revision {
+                                                    save_state.set(SaveState::FileSaved);
+                                                }
                                                 status.set("Saved changes to the mapped JSON and sprite sheet".to_owned());
                                             }
                                             Err(error) => status.set(format!("Save failed: {error}")),
@@ -638,7 +926,12 @@ fn App() -> Element {
                                 (Ok(json), Ok(png)) => {
                                     let json_result = download_file("cnipix_animated_sprite.json", "application/json", json.as_bytes());
                                     let png_result = download_file("cnipix_spritesheet.png", "image/png", &png);
-                                    status.set(if json_result.is_ok() && png_result.is_ok() { "Downloaded game JSON and sprite sheet".to_owned() } else { "Export could not start in this browser".to_owned() });
+                                    if json_result.is_ok() && png_result.is_ok() {
+                                        save_state.set(SaveState::FileSaved);
+                                        status.set("Downloaded game JSON and sprite sheet".to_owned());
+                                    } else {
+                                        status.set("Export could not start in this browser".to_owned());
+                                    }
                                 }
                                 (Err(error), _) => status.set(format!("JSON export failed: {error}")),
                                 (_, Err(error)) => status.set(format!("PNG export failed: {error}")),
@@ -656,6 +949,33 @@ fn App() -> Element {
                         header { class: "project-browser-header",
                             div { strong { "Mapped projects" } span { "Open animation files from a game folder" } }
                             div { class: "project-browser-actions",
+                                if *directory_permission_needed.read() {
+                                    button { class: "button button-soft", onclick: move |_| {
+                                        status.set("Requesting access to the saved folder…".to_owned());
+                                        match cnipixReconnectDirectory() {
+                                            Ok(promise) => { spawn(async move {
+                                                match restore_project_directory(promise).await {
+                                                    Ok(DirectoryRestore::Mapped(projects)) => {
+                                                        match reopen_saved_mapping(&projects, mapping_target.read().clone(), palette.read().clone()).await {
+                                                            Ok(Some(mapping)) => active_mapping.set(Some(mapping)),
+                                                            Ok(None) => {},
+                                                            Err(error) => status.set(format!("Could not reconnect the active project: {error}")),
+                                                        }
+                                                        let count = projects.iter().map(|project| project.animations.len()).sum::<usize>();
+                                                        directory_projects.set(projects);
+                                                        directory_mapped.set(true);
+                                                        directory_permission_needed.set(false);
+                                                        status.set(format!("Reconnected saved folder · {count} animations ready"));
+                                                    }
+                                                    Ok(DirectoryRestore::PermissionRequired) => status.set("Folder access was not granted".to_owned()),
+                                                    Ok(DirectoryRestore::NoSavedFolder) => status.set("No saved folder handle is available · choose the folder again".to_owned()),
+                                                    Err(error) => status.set(format!("Could not reconnect saved folder: {error}")),
+                                                }
+                                            }); },
+                                            Err(error) => status.set(format!("Could not reconnect saved folder: {}", js_error_message(error))),
+                                        }
+                                    }, "Reconnect saved folder" }
+                                }
                                 button { class: "button button-soft", onclick: move |_| {
                                     status.set("Choose a game root or its assets folder…".to_owned());
                                     match cnipixMapDirectory() {
@@ -663,9 +983,20 @@ fn App() -> Element {
                                             spawn(async move {
                                                 match map_project_directory(promise).await {
                                                     Ok(projects) => {
+                                                        let target = mapping_target.read().clone();
+                                                        let saved_palette = palette.read().clone();
+                                                        match reopen_saved_mapping(&projects, target, saved_palette).await {
+                                                            Ok(Some(mapping)) => active_mapping.set(Some(mapping)),
+                                                            Ok(None) => {
+                                                                active_mapping.set(None);
+                                                                mapping_target.set(None);
+                                                            }
+                                                            Err(error) => status.set(format!("Folder mapped, but the active project could not be reconnected: {error}")),
+                                                        }
                                                         let count = projects.iter().map(|project| project.animations.len()).sum::<usize>();
                                                         directory_projects.set(projects);
                                                         directory_mapped.set(true);
+                                                        directory_permission_needed.set(false);
                                                         directory_browser_open.set(false);
                                                         status.set(format!("Mapped folder · {count} animations ready"));
                                                     }
@@ -732,6 +1063,7 @@ fn App() -> Element {
                                                                     selection_anchor.set(None);
                                                                     selection_drag.set(None);
                                                                     clipboard.set(None);
+                                                                    mapping_target.set(Some((mapping.json_path.clone(), mapping.animation_index)));
                                                                     active_mapping.set(Some(mapping));
                                                                     directory_browser_open.set(false);
                                                                     status.set(format!("Opened {project_name} · edits can be saved to the mapped files"));
@@ -751,7 +1083,7 @@ fn App() -> Element {
                             }
                         }
                         footer { class: "project-browser-footer",
-                            span { "Choose a project to load it into the editor. Saving writes the JSON and PNG back into this folder." }
+                            span { "Folder access is remembered in this browser. Saving writes the JSON and PNG back into this folder." }
                             if mapped_project_active { span { class: "mapped-ready", "● Active project is mapped" } }
                         }
                     }
@@ -873,6 +1205,7 @@ fn App() -> Element {
                                                                 selection_drag.set(None);
                                                                 clipboard.set(None);
                                                                 tool.set(Tool::Pencil);
+                                                                mapping_target.set(Some((mapping.json_path.clone(), mapping.animation_index)));
                                                                 active_mapping.set(Some(mapping));
                                                                 status.set(format!("Opened {project_name} · edits can be saved to the mapped files"));
                                                             }
@@ -1071,10 +1404,11 @@ fn App() -> Element {
                         div { class: "workspace-tools",
                             span { class: "dimension-badge", "{w} × {h}" }
                             span { class: "workspace-separator" }
-                            span { class: "hint-text", "Scroll to zoom · drag scrollbars to pan" }
+                            span { class: "hint-text", "Scroll to zoom · Shift+drag to pan freely" }
                         }
                     }
-                    div { class: "canvas-viewport",
+                    div {
+                        class: "canvas-viewport",
                         onwheel: move |event| {
                             event.prevent_default();
                             let delta = event.data().delta().strip_units().y;
@@ -1185,7 +1519,7 @@ fn App() -> Element {
             footer { class: "statusbar",
                 span { class: "status-ready", span { class: "live-dot" } "{status}" }
                 span { class: "status-shortcuts", "Undo / redo: Ctrl+Z / Ctrl+Y · Erase: right click · Tools: B / M / G" }
-                span { class: "status-version", "cnipix  ·  browser edition" }
+                span { class: "status-version", "Autosave · this browser" }
             }
         }
     }
@@ -1195,6 +1529,29 @@ fn App() -> Element {
 fn FrameNumber(number: usize) -> Element {
     let label = format!("{number:02}");
     rsx! { span { "{label}" } }
+}
+
+fn validate_autosave(draft: &AutosaveProject) -> Result<(), ()> {
+    if draft.version != 1
+        || !(1..=CELL_LIMIT).contains(&draft.width)
+        || !(1..=CELL_LIMIT).contains(&draft.height)
+        || !(1..=256).contains(&draft.palette.len())
+        || draft.frames.is_empty()
+        || draft.frames.iter().any(|frame| {
+            frame.pixels.len() != draft.width * draft.height
+                || frame
+                    .pixels
+                    .iter()
+                    .any(|index| *index as usize >= draft.palette.len())
+        })
+        || draft
+            .palette
+            .iter()
+            .any(|color| parse_color_input(color).is_err())
+    {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn document_snapshot(
@@ -1413,6 +1770,21 @@ async fn map_project_directory(promise: js_sys::Promise) -> Result<Vec<MappedPro
     serde_json::from_str(&json).map_err(|error| format!("could not read folder index: {error}"))
 }
 
+async fn restore_project_directory(promise: js_sys::Promise) -> Result<DirectoryRestore, String> {
+    use wasm_bindgen_futures::JsFuture;
+    let result = JsFuture::from(promise).await.map_err(js_error_message)?;
+    let value = result
+        .as_string()
+        .ok_or("saved folder restore returned invalid data")?;
+    match value.as_str() {
+        "" => Ok(DirectoryRestore::NoSavedFolder),
+        "__CNIPIX_PERMISSION_REQUIRED__" => Ok(DirectoryRestore::PermissionRequired),
+        json => serde_json::from_str(json)
+            .map(DirectoryRestore::Mapped)
+            .map_err(|error| format!("could not read saved folder index: {error}")),
+    }
+}
+
 async fn open_mapped_project(
     id: u32,
     animation_index: usize,
@@ -1448,6 +1820,29 @@ async fn open_mapped_project(
     };
     let project = load_project_animation(&manifest, &png, &palette, animation_index)?;
     Ok((project, mapping))
+}
+
+async fn reopen_saved_mapping(
+    projects: &[MappedProject],
+    target: Option<(String, usize)>,
+    palette: Vec<String>,
+) -> Result<Option<ActiveMapping>, String> {
+    let Some((path, animation_index)) = target else {
+        return Ok(None);
+    };
+    let Some(project) = projects.iter().find(|project| project.path == path) else {
+        return Ok(None);
+    };
+    let Some(animation) = project
+        .animations
+        .iter()
+        .find(|animation| animation.index == animation_index)
+    else {
+        return Ok(None);
+    };
+    let (_, mapping) =
+        open_mapped_project(project.id, animation.index, &project.path, palette).await?;
+    Ok(Some(mapping))
 }
 
 async fn write_mapped_project(id: u32, manifest: &str, png: &[u8]) -> Result<(), String> {
@@ -2058,6 +2453,14 @@ fn PixelCell(
             style: "background-color: {background}",
             title: "{title}",
             onpointerdown: move |event| {
+                if event
+                    .data()
+                    .downcast::<web_sys::PointerEvent>()
+                    .is_some_and(|pointer| pointer.shift_key())
+                {
+                    event.prevent_default();
+                    return;
+                }
                 if event
                     .data()
                     .downcast::<web_sys::PointerEvent>()
