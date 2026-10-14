@@ -19,6 +19,37 @@ struct Frame {
     pixels: Vec<u8>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    Pencil,
+    Select,
+    Fill,
+    Paste,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Selection {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Clone, PartialEq)]
+struct Clipboard {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq)]
+struct SelectionDrag {
+    start_x: usize,
+    start_y: usize,
+    source: Selection,
+    pixels: Vec<u8>,
+}
+
 #[derive(Serialize)]
 struct AnimationExport {
     spritesheet: String,
@@ -50,6 +81,13 @@ fn App() -> Element {
     let mut frame_time_ms = use_signal(|| INITIAL_FRAME_TIME_MS);
     let mut selected_frame = use_signal(|| 0usize);
     let mut selected_color = use_signal(|| 2usize);
+    let mut right_erasing = use_signal(|| false);
+    let mut tool = use_signal(|| Tool::Pencil);
+    let mut selection = use_signal(|| None::<Selection>);
+    let mut selection_anchor = use_signal(|| None::<(usize, usize)>);
+    let mut selection_drag = use_signal(|| None::<SelectionDrag>);
+    let mut clipboard = use_signal(|| None::<Clipboard>);
+    let mut hovered_pixel = use_signal(|| None::<usize>);
     let mut painting = use_signal(|| false);
     let mut playing = use_signal(|| false);
     let mut preview_open = use_signal(|| false);
@@ -87,6 +125,9 @@ fn App() -> Element {
     let frame_time = *frame_time_ms.read();
     let active = (*selected_frame.read()).min(frames.read().len().saturating_sub(1));
     let selected = *selected_color.read();
+    let active_tool = *tool.read();
+    let selected_region = *selection.read();
+    let clipboard_available = clipboard.read().is_some();
     let zoom_level = *zoom.read();
     let is_onion = *onion_skin.read();
     let is_playing = *playing.read();
@@ -125,8 +166,121 @@ fn App() -> Element {
         document::Link { rel: "stylesheet", href: MAIN_CSS }
         main {
             class: "app-shell",
-            onpointerup: move |_| painting.set(false),
-            onpointercancel: move |_| painting.set(false),
+            tabindex: "0",
+            onkeydown: move |event| {
+                use wasm_bindgen::JsCast;
+                let data = event.data();
+                let Some(keyboard) = data.downcast::<web_sys::KeyboardEvent>() else { return; };
+                if let Some(target) = keyboard.target().and_then(|target| target.dyn_into::<web_sys::Element>().ok()) {
+                    if matches!(target.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT") { return; }
+                }
+                let key = keyboard.key().to_ascii_lowercase();
+                if keyboard.ctrl_key() || keyboard.meta_key() {
+                    match key.as_str() {
+                        "c" => {
+                            event.prevent_default();
+                            if let Some(region) = *selection.read() {
+                                let frame = *selected_frame.read();
+                                let pixels = frames.read()[frame].pixels.clone();
+                                clipboard.set(Some(copy_region(&pixels, *width.read(), region)));
+                                status.set("Selection copied".to_owned());
+                            } else {
+                                status.set("Select an area before copying".to_owned());
+                            }
+                        }
+                        "v" => {
+                            event.prevent_default();
+                            if let Some(copy) = clipboard.read().clone() {
+                                if let Some(index) = *hovered_pixel.read() {
+                                    let frame = *selected_frame.read();
+                                    let canvas_width = *width.read();
+                                    let region = paste_clipboard(
+                                        &mut frames,
+                                        frame,
+                                        canvas_width,
+                                        *height.read(),
+                                        index % canvas_width,
+                                        index / canvas_width,
+                                        &copy,
+                                    );
+                                    selection.set(Some(region));
+                                    tool.set(Tool::Select);
+                                    status.set("Selection pasted".to_owned());
+                                } else {
+                                    tool.set(Tool::Paste);
+                                    status.set("Copied pixels ready · click the canvas to place them".to_owned());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+                if keyboard.alt_key() { return; }
+                if keyboard.shift_key() {
+                    let shifted_color = match keyboard.code().as_str() {
+                        "Digit1" => Some(10),
+                        "Digit2" => Some(11),
+                        "Digit3" => Some(12),
+                        "Digit4" => Some(13),
+                        "Digit5" => Some(14),
+                        "Digit6" => Some(15),
+                        _ => None,
+                    };
+                    if let Some(color) = shifted_color {
+                        selected_color.set(color);
+                        return;
+                    }
+                }
+                match key.as_str() {
+                    "0" => selected_color.set(0),
+                    "escape" => {
+                        if selection.read().is_some() {
+                            event.prevent_default();
+                            selection.set(None);
+                            selection_anchor.set(None);
+                            selection_drag.set(None);
+                            status.set("Selection cleared".to_owned());
+                        }
+                    }
+                    "delete" | "backspace" => {
+                        if let Some(region) = *selection.read() {
+                            event.prevent_default();
+                            let frame = *selected_frame.read();
+                            let canvas_width = *width.read();
+                            frames.with_mut(|all| {
+                                for y in region.y..region.y + region.height {
+                                    for x in region.x..region.x + region.width {
+                                        all[frame].pixels[y * canvas_width + x] = 0;
+                                    }
+                                }
+                            });
+                            status.set("Selection cleared to transparent".to_owned());
+                        }
+                    }
+                    "b" => tool.set(Tool::Pencil),
+                    "m" => tool.set(Tool::Select),
+                    "g" => tool.set(Tool::Fill),
+                    _ => {
+                        if key.len() == 1 {
+                            if let Ok(color) = key.parse::<usize>() {
+                                if color <= 9 { selected_color.set(color); }
+                            }
+                        }
+                    }
+                }
+            },
+            onpointerup: move |_| {
+                painting.set(false);
+                right_erasing.set(false);
+                selection_anchor.set(None);
+                if let (Some(drag), Some(destination)) = (selection_drag.read().clone(), *selection.read()) {
+                    let frame = *selected_frame.read();
+                    commit_selection_move(&mut frames, frame, *width.read(), *height.read(), drag, destination);
+                }
+                selection_drag.set(None);
+            },
+            onpointercancel: move |_| { painting.set(false); right_erasing.set(false); selection_anchor.set(None); selection_drag.set(None); },
             header {
                 class: "topbar",
                 div { class: "brand-lockup",
@@ -194,6 +348,28 @@ fn App() -> Element {
                         frames.with_mut(|items| items.insert(at, copy));
                         selected_frame.set(at);
                     }, "Duplicate" }
+                    button { class: if active_tool == Tool::Pencil { "button button-tool active" } else { "button button-tool" }, onclick: move |_| tool.set(Tool::Pencil), "✎ Pencil (B)" }
+                    button { class: if active_tool == Tool::Select { "button button-tool active" } else { "button button-tool" }, onclick: move |_| tool.set(Tool::Select), "▧ Select (M)" }
+                    button { class: if active_tool == Tool::Fill { "button button-tool active" } else { "button button-tool" }, onclick: move |_| tool.set(Tool::Fill), "▨ Fill (G)" }
+                    button { class: "button button-quiet", disabled: selected_region.is_none(), onclick: move |_| {
+                        if let Some(region) = *selection.read() {
+                            let frame = *selected_frame.read();
+                            let pixels = frames.read()[frame].pixels.clone();
+                            clipboard.set(Some(copy_region(&pixels, *width.read(), region)));
+                            status.set("Selection copied · choose Paste and click a destination".to_owned());
+                        }
+                    }, "Copy" }
+                    button { class: "button button-quiet", disabled: !clipboard_available, onclick: move |_| {
+                        if clipboard.read().is_some() {
+                            tool.set(Tool::Paste);
+                            status.set("Click the canvas to place the copied pixels".to_owned());
+                        }
+                    }, "Paste" }
+                    button { class: "button button-quiet", disabled: selected_region.is_none(), onclick: move |_| {
+                        selection.set(None);
+                        selection_anchor.set(None);
+                        selection_drag.set(None);
+                    }, "Deselect" }
                     button { class: if is_playing { "button button-play active" } else { "button button-play" }, onclick: move |_| {
                         if is_playing {
                             playing.set(false);
@@ -224,14 +400,14 @@ fn App() -> Element {
             section { class: "editor-layout",
                 aside { class: "sidebar",
                     section { class: "side-section palette-section",
-                        div { class: "section-heading", span { "Palette" } span { class: "section-hint", "16 colors" } }
+                        div { class: "section-heading", span { "Palette" } span { class: "section-hint", "0 erase · 1–9 / ⇧1–6" } }
                         div { class: "palette-grid",
                             for (index, color) in PALETTE.iter().enumerate() {
                                 button {
                                     key: "swatch-{index}",
                                     class: if index == selected { "swatch selected" } else { "swatch" },
                                     style: if index == 0 { "--swatch: transparent".to_owned() } else { format!("--swatch: {color}") },
-                                    title: if index == 0 { "Transparent / erase".to_owned() } else { format!("Palette color {}", index) },
+                                    title: if index == 0 { "0 · Transparent / erase".to_owned() } else if index <= 9 { format!("{index} · Palette color {index}") } else { format!("Palette color {index}") },
                                     onclick: move |_| selected_color.set(index),
                                     if index == 0 { span { class: "clear-mark", "×" } }
                                 }
@@ -304,7 +480,17 @@ fn App() -> Element {
                         div {
                             class: "pixel-grid",
                             style: "{grid_style}",
-                            onpointerleave: move |_| painting.set(false),
+                            tabindex: "0",
+                            onpointerdown: move |event| {
+                                use wasm_bindgen::JsCast;
+                                if let Some(pointer) = event.data().downcast::<web_sys::PointerEvent>() {
+                                    if let Some(element) = pointer.current_target().and_then(|target| target.dyn_into::<web_sys::HtmlElement>().ok()) {
+                                        let _ = element.focus();
+                                    }
+                                }
+                            },
+                            oncontextmenu: move |event| event.prevent_default(),
+                            onpointerleave: move |_| { painting.set(false); hovered_pixel.set(None); },
                             for (index, pixel) in current_pixels.iter().enumerate() {
                                 PixelCell {
                                     key: "pixel-{index}",
@@ -317,6 +503,14 @@ fn App() -> Element {
                                     selected_frame,
                                     selected_color,
                                     painting,
+                                    right_erasing,
+                                    tool,
+                                    selection,
+                                    selection_anchor,
+                                    selection_drag,
+                                    clipboard,
+                                    hovered_pixel,
+                                    height: h,
                                 }
                             }
                         }
@@ -380,7 +574,7 @@ fn App() -> Element {
             }
             footer { class: "statusbar",
                 span { class: "status-ready", span { class: "live-dot" } "{status}" }
-                span { class: "status-shortcuts", "Paint: drag · Pan: scroll · Zoom: controls" }
+                span { class: "status-shortcuts", "Erase: right click · Tools: B / M / G · Colors: 0–9 · Copy / paste: Ctrl+C / Ctrl+V" }
                 span { class: "status-version", "cnipix  ·  browser edition" }
             }
         }
@@ -413,17 +607,148 @@ fn resize_frames(
     });
 }
 
+fn selection_from_points(x1: usize, y1: usize, x2: usize, y2: usize) -> Selection {
+    Selection {
+        x: x1.min(x2),
+        y: y1.min(y2),
+        width: x1.abs_diff(x2) + 1,
+        height: y1.abs_diff(y2) + 1,
+    }
+}
+
+fn copy_region(pixels: &[u8], canvas_width: usize, region: Selection) -> Clipboard {
+    let mut copied = Vec::with_capacity(region.width * region.height);
+    for y in region.y..region.y + region.height {
+        for x in region.x..region.x + region.width {
+            copied.push(pixels[y * canvas_width + x]);
+        }
+    }
+    Clipboard {
+        width: region.width,
+        height: region.height,
+        pixels: copied,
+    }
+}
+
+fn paste_clipboard(
+    frames: &mut Signal<Vec<Frame>>,
+    frame: usize,
+    canvas_width: usize,
+    canvas_height: usize,
+    x: usize,
+    y: usize,
+    clipboard: &Clipboard,
+) -> Selection {
+    let pasted_width = clipboard.width.min(canvas_width.saturating_sub(x));
+    let pasted_height = clipboard.height.min(canvas_height.saturating_sub(y));
+    frames.with_mut(|all| {
+        for dy in 0..pasted_height {
+            for dx in 0..pasted_width {
+                all[frame].pixels[(y + dy) * canvas_width + x + dx] =
+                    clipboard.pixels[dy * clipboard.width + dx];
+            }
+        }
+    });
+    Selection {
+        x,
+        y,
+        width: pasted_width,
+        height: pasted_height,
+    }
+}
+
+fn commit_selection_move(
+    frames: &mut Signal<Vec<Frame>>,
+    frame: usize,
+    canvas_width: usize,
+    canvas_height: usize,
+    drag: SelectionDrag,
+    destination: Selection,
+) {
+    if drag.source.x == destination.x && drag.source.y == destination.y {
+        return;
+    }
+    frames.with_mut(|all| {
+        let pixels = &mut all[frame].pixels;
+        for y in drag.source.y..drag.source.y + drag.source.height {
+            for x in drag.source.x..drag.source.x + drag.source.width {
+                pixels[y * canvas_width + x] = 0;
+            }
+        }
+        for dy in 0..drag
+            .source
+            .height
+            .min(canvas_height.saturating_sub(destination.y))
+        {
+            for dx in 0..drag
+                .source
+                .width
+                .min(canvas_width.saturating_sub(destination.x))
+            {
+                pixels[(destination.y + dy) * canvas_width + destination.x + dx] =
+                    drag.pixels[dy * drag.source.width + dx];
+            }
+        }
+    });
+}
+
+fn flood_fill(
+    frames: &mut Signal<Vec<Frame>>,
+    frame: usize,
+    width: usize,
+    height: usize,
+    start: usize,
+    replacement: u8,
+) {
+    frames.with_mut(|all| {
+        let pixels = &mut all[frame].pixels;
+        let target = pixels[start];
+        if target == replacement {
+            return;
+        }
+        let mut stack = vec![start];
+        while let Some(index) = stack.pop() {
+            if pixels[index] != target {
+                continue;
+            }
+            pixels[index] = replacement;
+            let x = index % width;
+            let y = index / width;
+            if x > 0 {
+                stack.push(index - 1);
+            }
+            if x + 1 < width {
+                stack.push(index + 1);
+            }
+            if y > 0 {
+                stack.push(index - width);
+            }
+            if y + 1 < height {
+                stack.push(index + width);
+            }
+        }
+    });
+}
+
 #[component]
 fn PixelCell(
     index: usize,
     width: usize,
+    height: usize,
     pixel: u8,
     ghost: u8,
     onion: bool,
-    frames: Signal<Vec<Frame>>,
+    mut frames: Signal<Vec<Frame>>,
     selected_frame: Signal<usize>,
     selected_color: Signal<usize>,
-    painting: Signal<bool>,
+    mut painting: Signal<bool>,
+    mut right_erasing: Signal<bool>,
+    mut tool: Signal<Tool>,
+    mut selection: Signal<Option<Selection>>,
+    mut selection_anchor: Signal<Option<(usize, usize)>>,
+    mut selection_drag: Signal<Option<SelectionDrag>>,
+    mut clipboard: Signal<Option<Clipboard>>,
+    mut hovered_pixel: Signal<Option<usize>>,
 ) -> Element {
     let is_current = pixel > 0;
     let show_ghost = onion && !is_current && ghost > 0;
@@ -437,6 +762,12 @@ fn PixelCell(
     let row = index / width;
     let col = index % width;
     let title = format!("Pixel {}, {}", col + 1, row + 1);
+    let selected_here = selection.read().is_some_and(|region| {
+        col >= region.x
+            && col < region.x + region.width
+            && row >= region.y
+            && row < region.y + region.height
+    });
     let class = if show_ghost {
         "pixel ghost-pixel"
     } else if is_current {
@@ -444,25 +775,93 @@ fn PixelCell(
     } else {
         "pixel"
     };
+    let class = if selected_here {
+        format!("{class} selected-pixel")
+    } else {
+        class.to_owned()
+    };
     rsx! {
         div {
             class: "{class}",
             style: "background-color: {background}",
             title: "{title}",
-            onpointerdown: move |_| {
-                painting.set(true);
+            onpointerdown: move |event| {
+                if event
+                    .data()
+                    .downcast::<web_sys::PointerEvent>()
+                    .is_some_and(|pointer| pointer.button() == 2)
+                {
+                    event.prevent_default();
+                    right_erasing.set(true);
+                    frames.with_mut(|all| all[*selected_frame.read()].pixels[index] = 0);
+                    return;
+                }
                 let frame = *selected_frame.read();
-                let color = *selected_color.read() as u8;
-                frames.with_mut(|all| all[frame].pixels[index] = color);
-            },
-            onpointerenter: move |_| {
-                if painting() {
-                    let frame = *selected_frame.read();
-                    let color = *selected_color.read() as u8;
-                    frames.with_mut(|all| all[frame].pixels[index] = color);
+                let x = index % width;
+                let y = index / width;
+                let current_tool = *tool.read();
+                match current_tool {
+                    Tool::Pencil => {
+                        painting.set(true);
+                        let color = *selected_color.read() as u8;
+                        frames.with_mut(|all| all[frame].pixels[index] = color);
+                    }
+                    Tool::Fill => {
+                        let color = *selected_color.read() as u8;
+                        flood_fill(&mut frames, frame, width, height, index, color);
+                        tool.set(Tool::Pencil);
+                    }
+                    Tool::Select => {
+                        let current_selection = *selection.read();
+                        if let Some(region) = current_selection {
+                            if x >= region.x && x < region.x + region.width && y >= region.y && y < region.y + region.height {
+                                let pixels = copy_region(&frames.read()[frame].pixels, width, region).pixels;
+                                selection_drag.set(Some(SelectionDrag { start_x: x, start_y: y, source: region, pixels }));
+                            } else {
+                                selection_anchor.set(Some((x, y)));
+                                selection.set(Some(Selection { x, y, width: 1, height: 1 }));
+                            }
+                        } else {
+                            selection_anchor.set(Some((x, y)));
+                            selection.set(Some(Selection { x, y, width: 1, height: 1 }));
+                        }
+                    }
+                    Tool::Paste => {
+                        if let Some(copy) = clipboard.read().clone() {
+                            let region = paste_clipboard(&mut frames, frame, width, height, x, y, &copy);
+                            selection.set(Some(region));
+                            tool.set(Tool::Select);
+                        }
+                    }
                 }
             },
-            onpointerup: move |_| painting.set(false),
+            onpointerenter: move |_| {
+                hovered_pixel.set(Some(index));
+                let frame = *selected_frame.read();
+                if right_erasing() {
+                    frames.with_mut(|all| all[frame].pixels[index] = 0);
+                } else {
+                    let current_tool = *tool.read();
+                    match current_tool {
+                        Tool::Pencil if painting() => {
+                            let color = *selected_color.read() as u8;
+                            frames.with_mut(|all| all[frame].pixels[index] = color);
+                        }
+                        Tool::Select => {
+                            if let Some((anchor_x, anchor_y)) = *selection_anchor.read() {
+                                selection.set(Some(selection_from_points(anchor_x, anchor_y, col, row)));
+                            } else if let Some(drag) = selection_drag.read().clone() {
+                                let new_x = (drag.source.x as isize + col as isize - drag.start_x as isize)
+                                    .clamp(0, width.saturating_sub(drag.source.width) as isize) as usize;
+                                let new_y = (drag.source.y as isize + row as isize - drag.start_y as isize)
+                                    .clamp(0, height.saturating_sub(drag.source.height) as isize) as usize;
+                                selection.set(Some(Selection { x: new_x, y: new_y, ..drag.source }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            },
         }
     }
 }

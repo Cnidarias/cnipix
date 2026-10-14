@@ -50,6 +50,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid #bca8ff; outline-
 .button-primary:hover { background: #c6b6ff; }
 .button-play { color: #a9e2c8; border-color: #355447; background: #1d3029; }
 .button-play:hover, .button-play.active { background: #294538; }
+.button-tool { color: #b2b7c3; border-color: #343945; background: #22252d; }
+.button-tool:hover { background: #2b2f39; border-color: #4b5160; }
+.button-tool.active { color: #e6e1f5; border-color: #75629e; background: #332b45; box-shadow: inset 0 0 0 1px #a88bfa44; }
 .plus-icon { font-size: 17px; line-height: 1; }
 .onion-icon { color: #c1a8ff; font-size: 15px; }
 .toolbar-divider { height: 25px; width: 1px; margin: 0 7px; background: var(--line); }
@@ -102,6 +105,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid #bca8ff; outline-
 .pixel { width: var(--pixel-size); height: var(--pixel-size); cursor: crosshair; }
 .pixel:hover { outline: 1px solid #f2eaffaa; outline-offset: -1px; }
 .pixel.ghost-pixel { box-shadow: inset 0 0 0 1px #d4baff77; }
+.pixel.selected-pixel { outline: 1px dashed #fff; outline-offset: -2px; z-index: 1; }
 .canvas-caption { height: 30px; flex: 0 0 30px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 13px; border-top: 1px solid #2d313b; color: #737b8a; font: 9px 'DM Mono', monospace; }
 .caption-left { color: #ad93e5; }
 

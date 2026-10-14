@@ -17,6 +17,11 @@ Open the local address printed by `dx serve` in a browser. Dioxus uses WebAssemb
 ## Editing
 
 - Draw with click or pointer-drag using the palette. Palette slot zero clears pixels and exports transparent alpha.
+- Use Select to drag out a rectangular region, drag an existing selection to move it, then Copy and Paste to duplicate it elsewhere. Fill replaces the connected region under the cursor with the selected color.
+- Use `Ctrl+C` / `Ctrl+V` (or `Cmd+C` / `Cmd+V` on macOS) to copy and paste a selection. Paste lands at the pointer when it is over the canvas; otherwise click the canvas to place it.
+- Press `Delete` or `Backspace` to clear the selected region to transparency.
+- Press `Escape` to deselect.
+- Right-click or right-drag on the canvas to erase pixels. Press `0` for transparent, `1`–`9` for palette colors 1–9, and `Shift+1`–`Shift+6` for palette colors 10–15. Press `B` for Pencil, `M` for Select, and `G` for Fill. Keyboard shortcuts are ignored while editing text or numeric inputs.
 - Set the frame cell width and height independently from 1–64 pixels. Resizing keeps the top-left portion of existing artwork.
 - Set frame timing from 10–2000 ms. **Preview animation** opens a stage that loops through the timeline at that speed.
 - Onion skin is on by default and shows the previous frame beneath transparent pixels in the selected frame.
