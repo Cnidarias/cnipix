@@ -1,0 +1,10 @@
+[application]
+name = "cnipix"
+default_platform = "web"
+
+[web.app]
+title = "cnipix · pixel animation studio"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]

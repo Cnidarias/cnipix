@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Dioxus build output
+/dist/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Editor and operating system files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
